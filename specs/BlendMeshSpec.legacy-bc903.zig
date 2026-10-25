@@ -1,0 +1,525 @@
+// LEGACY VARIANT for game builds whose files start with "BinarySerializer:bc903cedc178305c".
+// Derived from the dev's BlendMeshSpec.zig (schema 1ae1ac9946a50dce) by removing Mesh.normals;
+// verified byte-for-byte against the shipped bike-4stroke.blend.bin.
+
+pub const binary_header = "BinarySerializer:bc903cedc178305c:utils.BlendMeshSpec\n";
+
+pub const BlendMeshSpec = struct {
+    framerate: u32,
+    nodes: []Node,
+};
+
+pub const Node = struct {
+    name: []const u8,
+    type: []const u8,
+    parent: ?[]const u8,
+    position: Vec4,
+    rotation: Quat,
+    scale: Vec4,
+    material: ?BasicMaterial = null,
+    mesh: ?Mesh = null,
+    linked_mesh: ?LinkedMesh = null,
+    armature: ?Armature = null,
+    curve: ?Curve = null,
+};
+
+pub const Vec4 = packed struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32 = 0,
+};
+
+pub const Quat = packed struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+};
+
+pub const BasicMaterial = struct {
+    color: Vec4,
+    roughness: f32 = 1,
+    metallic: f32 = 0,
+    diffuse_texture: ?[]const u8 = null,
+    normal_texture: ?[]const u8 = null,
+    roughness_metallic_texture: ?[]const u8 = null,
+    baked_material_texture: ?[]const u8 = null,
+};
+
+pub const Mesh = struct {
+    polygons: []const []const u32,
+    positions: []const Vec4,
+    uvs: []const Vec2,
+    bone_indices: []const [3]i8,
+    bone_weights: []const [3]f32,
+    vertex_groups: []const VertexGroup = &.{},
+    subdiv_levels: u32 = 0,
+    costume: ?Costume = null,
+    terrain: ?Terrain = null,
+};
+
+pub const Vec2 = packed struct {
+    x: f32,
+    y: f32,
+};
+
+pub const VertexGroup = struct {
+    name: []const u8,
+    points: []const u32,
+    weights: []const f32 = &.{},
+};
+
+pub const Costume = struct {
+    slot: Slot,
+    bounds: Bounds,
+    quad_deforms: []const QuadDeform,
+};
+
+pub const Slot = enum(u2) {
+    jacket = 0,
+    pants = 1,
+    boots = 2,
+    gloves = 3,
+};
+
+pub const Bounds = struct {
+    min: Vec4,
+    max: Vec4,
+};
+
+pub const QuadDeform = struct {
+    quad_idx: u32,
+    position: MappedPosition,
+    uv: Vec2,
+    normal: MappedNormal,
+    tangent: MappedTangent,
+};
+
+pub const MappedPosition = struct {
+    u: f32,
+    v: f32,
+    height: f32,
+};
+
+pub const MappedNormal = struct {
+    normal: f32,
+    tangent: f32,
+    bitangent: f32,
+};
+
+pub const MappedTangent = struct {
+    normal: f32,
+    tangent: f32,
+    bitangent: f32,
+    handedness: f32,
+};
+
+pub const Terrain = struct {
+    bounds: Bounds,
+    base_height: @"Map2D(f16)",
+    height_clips: []const HeightClip,
+    biome_height: @"EnumArray(HeightBiome,Map2D(u8))",
+    material_weights: @"Map2D(MaterialBlend)",
+};
+
+pub const @"Map2D(f16)" = struct {
+    map: []f16,
+    grid: Grid2D,
+};
+
+pub const Grid2D = struct {
+    resolution: Coord,
+    padding: Coord = .{
+        .x = 0,
+        .y = 0,
+    },
+};
+
+pub const Coord = packed struct {
+    x: i32,
+    y: i32,
+};
+
+pub const HeightClip = struct {
+    bounds: Bounds,
+    height: @"Map2D(f16)",
+};
+
+pub const @"EnumArray(HeightBiome,Map2D(u8))" = struct {
+    values: [2]@"Map2D(u8)",
+};
+
+pub const @"Map2D(u8)" = struct {
+    map: []u8,
+    grid: Grid2D,
+};
+
+pub const @"Map2D(MaterialBlend)" = struct {
+    map: []MaterialBlend,
+    grid: Grid2D,
+};
+
+pub const MaterialBlend = packed struct {
+    first: u4,
+    second: u4,
+    blend: u8,
+};
+
+pub const LinkedMesh = struct {
+    blend_path: []const u8,
+    node_name: []const u8,
+    mesh_name: []const u8,
+};
+
+pub const Armature = struct {
+    bones: []const Bone,
+    animation: []const struct {
+        frame: u32,
+        bones: []const Transform,
+    },
+    markers: []const AnimationMarker,
+};
+
+pub const Bone = struct {
+    name: []const u8,
+    parent: ?u32,
+    length: f32,
+    rest: Transform,
+};
+
+pub const Transform = struct {
+    position: Vec4,
+    rotation: Quat,
+};
+
+pub const AnimationMarker = struct {
+    name: []const u8,
+    frame: u32,
+};
+
+pub const Curve = struct {
+    splines: []const Spline,
+};
+
+pub const Spline = struct {
+    bezier_points: []const BezierPoint,
+};
+
+pub const BezierPoint = struct {
+    point: Vec4,
+    handle_left: Vec4,
+    handle_right: Vec4,
+};
+
+pub const BlendId = enum(u4) {
+    DebugSphere = 0,
+    backpack = 1,
+    @"bike-4stroke" = 2,
+    boots = 3,
+    @"dirt-particles" = 4,
+    gloves = 5,
+    hoodie = 6,
+    map = 7,
+    pants = 8,
+    rider = 9,
+    @"track-markers" = 10,
+    @"tree-parts" = 11,
+};
+
+pub const ModelId = union(enum) {
+    DebugSphere: @"DebugSphere.blend.generated.Nodes",
+    backpack: @"backpack.blend.generated.Nodes",
+    @"bike-4stroke": @"bike-4stroke.blend.generated.Nodes",
+    boots: @"boots.blend.generated.Nodes",
+    @"dirt-particles": @"dirt-particles.blend.generated.Nodes",
+    gloves: @"gloves.blend.generated.Nodes",
+    hoodie: @"hoodie.blend.generated.Nodes",
+    map: @"map.blend.generated.Nodes",
+    pants: @"pants.blend.generated.Nodes",
+    rider: @"rider.blend.generated.Nodes",
+    @"track-markers": @"track-markers.blend.generated.Nodes",
+    @"tree-parts": @"tree-parts.blend.generated.Nodes",
+};
+
+pub const @"DebugSphere.blend.generated.Nodes" = enum(u2) {
+    Camera = 0,
+    Light = 1,
+    sphere = 2,
+};
+
+pub const @"backpack.blend.generated.Nodes" = enum(u3) {
+    @"backpack.001" = 0,
+    @"backpack.double-sided" = 1,
+    @"B\xc3\xa9zierCurve" = 2,
+    logo = 3,
+    zipper = 4,
+    @"zipper.001" = 5,
+    Lattice = 6,
+    @"rig.body" = 7,
+};
+
+pub const @"bike-4stroke.blend.generated.Nodes" = enum(u7) {
+    back_tire = 0,
+    @"back_tire.material.Polished Chrome" = 1,
+    @"back_tire.material.Chrome" = 2,
+    @"back_tire.material.no_material" = 3,
+    @"back_tire.material.Dark Metal" = 4,
+    frame = 5,
+    @"frame.material.Metal" = 6,
+    @"frame.material.Seat" = 7,
+    @"frame.material.Dark Plastic" = 8,
+    @"frame.material.Chrome" = 9,
+    @"frame.material.Polished Chrome" = 10,
+    @"frame.material.no_material" = 11,
+    @"frame.material.Plastic.001" = 12,
+    @"frame.plastic.style.000" = 13,
+    @"frame.plastic.style.000.material.Plastic.001" = 14,
+    @"frame.plastic.style.001" = 15,
+    @"frame.plastic.style.001.material.Plastic" = 16,
+    front_tire = 17,
+    @"front_tire.material.Polished Chrome" = 18,
+    @"front_tire.material.Chrome" = 19,
+    @"front_tire.material.Dark Metal" = 20,
+    @"handlebars.bottom" = 21,
+    @"handlebars.bottom.material.Seat" = 22,
+    @"handlebars.plastic.style.000" = 23,
+    @"handlebars.plastic.style.001" = 24,
+    @"handlebars.top" = 25,
+    @"handlebars.top.material.Dark Metal" = 26,
+    @"handlebars.top.material.Metal" = 27,
+    @"handlebars.top.material.Polished Chrome" = 28,
+    @"handlebars.top.material.Dark Plastic" = 29,
+    @"handlebars.top.material.Seat" = 30,
+    @"handlebars.top.material.Button" = 31,
+    @"handlebars.top.material.Plastic" = 32,
+    @"handlebars.top.material.Crashpad Plastic" = 33,
+    Lattice = 34,
+    @"Lattice.001" = 35,
+    @"mount.dab.source" = 36,
+    @"mount.fixed_camera" = 37,
+    @"mount.foot_out.left" = 38,
+    @"mount.foot_out.right" = 39,
+    @"mount.fork.capsule.end" = 40,
+    @"mount.fork.capsule.start" = 41,
+    @"mount.frame.capsule.end" = 42,
+    @"mount.frame.capsule.end.001" = 43,
+    @"mount.frame.capsule.start" = 44,
+    @"mount.frame.capsule.start.001" = 45,
+    @"mount.grab_target" = 46,
+    @"mount.handlebars.capsule.end" = 47,
+    @"mount.handlebars.capsule.start" = 48,
+    @"mount.rider_handlebar.left" = 49,
+    @"mount.rider_handlebar.left.001" = 50,
+    @"mount.rider_handlebar.right" = 51,
+    @"mount.rider_peg.left" = 52,
+    @"mount.rider_peg.right" = 53,
+    @"mount.seat.capsule.end" = 54,
+    @"mount.seat.capsule.end.001" = 55,
+    @"mount.seat.capsule.start" = 56,
+    @"mount.seat.capsule.start.001" = 57,
+    @"mount.steering_velocity_sample" = 58,
+    @"mount.steering_velocity_sample.001" = 59,
+    @"rider.head" = 60,
+    @"rider.seat" = 61,
+    @"suspension.bottom" = 62,
+    @"suspension.spring" = 63,
+    @"suspension.top" = 64,
+    @"suspension.top.material.Chrome" = 65,
+    swingarm = 66,
+    @"swingarm.material.Metal" = 67,
+    @"swingarm.material.Chrome" = 68,
+    @"swingarm.material.Dark Plastic" = 69,
+    @"swingarm.material.Polished Chrome" = 70,
+    tire_curve = 71,
+};
+
+pub const @"boots.blend.generated.Nodes" = enum(u2) {
+    boots = 0,
+    @"boots.002" = 1,
+    Lattice = 2,
+    @"rig.body" = 3,
+};
+
+pub const @"dirt-particles.blend.generated.Nodes" = enum(u3) {
+    Camera = 0,
+    Light = 1,
+    @"particle.large" = 2,
+    @"particle.medium" = 3,
+    @"particle.small" = 4,
+};
+
+pub const @"gloves.blend.generated.Nodes" = enum(u2) {
+    gloves = 0,
+    @"gloves.002" = 1,
+    Lattice = 2,
+    @"rig.body" = 3,
+};
+
+pub const @"hoodie.blend.generated.Nodes" = enum(u2) {
+    hoodie = 0,
+    @"hoodie.001" = 1,
+    @"rig.body" = 2,
+};
+
+pub const @"map.blend.generated.Nodes" = enum(u7) {
+    Base = 0,
+    Collider = 1,
+    @"Column.001" = 2,
+    @"Column.003" = 3,
+    @"Column.004" = 4,
+    @"Column.005" = 5,
+    @"Column.006" = 6,
+    @"Column.007" = 7,
+    @"Column.008" = 8,
+    @"Column.009" = 9,
+    @"Column.010" = 10,
+    Cube = 11,
+    @"Fence.001" = 12,
+    Glass = 13,
+    @"Heightmap.Base" = 14,
+    @"Heightmap.Base.Bump.001" = 15,
+    @"Heightmap.Base.Bump.002" = 16,
+    @"Heightmap.Base.Bump.003" = 17,
+    @"Heightmap.Base.Bump.004" = 18,
+    @"Heightmap.Base.Bump.005" = 19,
+    @"Heightmap.Base.Bump.006" = 20,
+    @"Heightmap.Base.Bump.007" = 21,
+    @"Heightmap.Base.Bump.008" = 22,
+    @"Heightmap.Base.Bump.009" = 23,
+    @"Heightmap.Base.Bump.010" = 24,
+    @"Heightmap.Base.Bump.011" = 25,
+    @"Heightmap.Base.Bump.012" = 26,
+    @"Heightmap.Base.Bump.013" = 27,
+    @"Heightmap.Base.Bump.014" = 28,
+    @"Heightmap.Base.Bump.015" = 29,
+    @"Heightmap.Base.Bump.016" = 30,
+    @"Heightmap.Base.FlatTestArea" = 31,
+    @"Heightmap.Base.Mountain.002" = 32,
+    @"Heightmap.Base.Track.001" = 33,
+    @"Heightmap.Base.Track.002" = 34,
+    @"Heightmap.Base.Track.003" = 35,
+    @"Heightmap.Canopy" = 36,
+    @"Heightmap.Dirt" = 37,
+    @"Heightmap.Gravel" = 38,
+    @"Heightmap.Gravel.001" = 39,
+    @"Heightmap.Path" = 40,
+    @"Heightmap.Rock" = 41,
+    @"Heightmap.Sand" = 42,
+    @"Heightmap.Stamp" = 43,
+    @"Heightmap.TrailHiding" = 44,
+    Lattice = 45,
+    @"Outline.Demo" = 46,
+    @"Ref.Ext.001" = 47,
+    River = 48,
+    @"Spawnpoint.Freeride" = 49,
+    @"Spawnpoint.GrassyArea" = 50,
+    @"Spawnpoint.Main" = 51,
+    @"Spawnpoint.Overlook" = 52,
+    @"Spawnpoint.ParkingLot" = 53,
+    @"Spawnpoint.Track" = 54,
+    @"Spawnpoint.Track.2" = 55,
+    Stairs = 56,
+    @"Stairs.001" = 57,
+    @"Track.Export.Clip" = 58,
+    @"Track2.Export.Clip" = 59,
+    @"Trail.Highway" = 60,
+    @"Trail.Main" = 61,
+    @"Trail.Main.005" = 62,
+    @"Trail.Single" = 63,
+    @"Trail.Single.001" = 64,
+    @"Trail.Single.Track3" = 65,
+    @"Trail.Track" = 66,
+    @"Trail.Track2" = 67,
+    @"Trim.001" = 68,
+};
+
+pub const @"pants.blend.generated.Nodes" = enum(u1) {
+    pants = 0,
+    @"rig.body" = 1,
+};
+
+pub const @"rider.blend.generated.Nodes" = enum(u6) {
+    @"base.backpack" = 0,
+    @"base.body" = 1,
+    @"base.boots" = 2,
+    @"base.gloves" = 3,
+    @"base.gloves.001" = 4,
+    @"base.jacket" = 5,
+    @"base.pants" = 6,
+    @"goggles.001" = 7,
+    @"goggles.double-sided" = 8,
+    @"goggles.trim" = 9,
+    head = 10,
+    helmet = 11,
+    @"helmet.001" = 12,
+    @"mount.capsule.end" = 13,
+    @"mount.capsule.start" = 14,
+    @"mount.center_of_mass" = 15,
+    @"mount.dab_zone" = 16,
+    @"mount.first_person.chest" = 17,
+    @"mount.first_person.chin" = 18,
+    @"mount.first_person.eyes" = 19,
+    @"mount.grab_target" = 20,
+    @"mount.left_foot_bottom" = 21,
+    @"mount.left_handle" = 22,
+    @"mount.right_foot_bottom" = 23,
+    @"mount.right_handle" = 24,
+    @"mount.seat" = 25,
+    @"rig.body" = 26,
+    @"rig.hands" = 27,
+    @"testwind.fan_blades" = 28,
+    @"testwind.tube" = 29,
+    Text = 30,
+    visor = 31,
+    @"GEO-pelvis_male_primitive_realistic" = 32,
+};
+
+pub const @"track-markers.blend.generated.Nodes" = enum(u4) {
+    bale = 0,
+    Camera = 1,
+    Light = 2,
+    @"mount.ground-anchor" = 3,
+    @"mount.tape-point" = 4,
+    stake = 5,
+    @"stake.tape-wrap" = 6,
+    @"tape.double-sided" = 7,
+    tile_preview_1 = 8,
+    tile_preview_2 = 9,
+};
+
+pub const @"tree-parts.blend.generated.Nodes" = enum(u5) {
+    @"Aspen.Branch" = 0,
+    @"Aspen.Branch.001" = 1,
+    @"Aspen.Leaf.double-sided.thin" = 2,
+    @"Aspen.Leaf.double-sided.thin.001" = 3,
+    @"Aspen.Trunk" = 4,
+    @"Aspen.Trunk.001" = 5,
+    Empty = 6,
+    @"Grass.Branch" = 7,
+    @"Grass.Branch.001" = 8,
+    @"Grass.Leaf.double-sided.thin" = 9,
+    @"Grass.Leaf.double-sided.thin.001" = 10,
+    Point = 11,
+    @"Spruce.Branch" = 12,
+    @"Spruce.Branch.001" = 13,
+    @"Spruce.NeedleBranch.double-sided.thin" = 14,
+    @"Spruce.NeedleBranch.double-sided.thin.001" = 15,
+    @"Spruce.Trunk" = 16,
+    @"Spruce.Trunk.001" = 17,
+};
+
+pub const TextureId = enum(u4) {
+    @"../blend-textures-tiling/bark-aspen_diffuse.generated.png" = 0,
+    @"../blend-textures-tiling/bark-aspen_normal.generated.png" = 1,
+    @"../blend-textures-tiling/cloth-weave_diffuse.generated.png" = 2,
+    @"../blend-textures-tiling/cloth-weave_normal.generated.png" = 3,
+    @"../model-textures/crashpad.png" = 4,
+    @"../model-textures/grass-leaf-diffuse.png" = 5,
+    @"../model-textures/leaf-diffuse.png" = 6,
+    @"../model-textures/logo-transparent.png" = 7,
+    @"../terrain-tiling/bark_birch_diffuse.generated.png" = 8,
+    @"../terrain-tiling/bark_birch_material.generated.png" = 9,
+    @"../terrain-tiling/bark_brown_diffuse.generated.png" = 10,
+    @"../terrain-tiling/bark_brown_material.generated.png" = 11,
+};

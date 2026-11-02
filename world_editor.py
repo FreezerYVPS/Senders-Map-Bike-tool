@@ -16,6 +16,8 @@ import json
 import math
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import tkinter as tk
 import zipfile
@@ -26,7 +28,7 @@ from PIL import Image
 
 import hm_core as C
 import mxb_io
-import objects_build as OB
+import mxs_io
 import hm_studio as HS
 import map_editor as ME
 import terrain_io as T
@@ -39,6 +41,50 @@ def app_dir():
     d = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'GameModelExporter')
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _settings_path():
+    return os.path.join(app_dir(), 'settings.json')
+
+
+def get_setting(app, key, default=None):
+    cfg = getattr(app, 'cfg', None)
+    if isinstance(cfg, dict) and cfg.get(key): return cfg[key]
+    try:
+        with open(_settings_path()) as f: return json.load(f).get(key) or default
+    except Exception:
+        return default
+
+
+def set_setting(app, key, value):
+    cfg = getattr(app, 'cfg', None)
+    if isinstance(cfg, dict): cfg[key] = value             # the launcher writes it back when it closes, too
+    try:
+        try:
+            with open(_settings_path()) as f: d = json.load(f)
+        except Exception:
+            d = {}
+        d[key] = value
+        with open(_settings_path() + '.tmp', 'w') as f: json.dump(d, f, indent=2)
+        os.replace(_settings_path() + '.tmp', _settings_path())
+    except OSError:
+        pass
+
+
+def default_save_dir():
+    home = os.path.expanduser('~')
+    for d in (os.path.join(home, 'Downloads'), os.path.join(home, 'Documents'), home):
+        if os.path.isdir(d): return d
+    return home
+
+
+def log_error(text):
+    import time as _t
+    try:
+        with open(os.path.join(app_dir(), 'studio_errors.log'), 'a') as f:
+            f.write('[%s] %s\n' % (_t.strftime('%Y-%m-%d %H:%M:%S'), text))
+    except OSError:
+        pass
 
 
 def safe_copy(src, dst):
@@ -77,8 +123,10 @@ class WorldEditor(HS.Studio):
         super().build()
         for k in ('new',): self.tb[k].pack_forget()
         self.tb['open'].config(text='Open work…'); self.tb['save'].config(text='Save work'); self.tb['saveas'].config(text='Save work as…')
+        self.tb['savemap'] = ttk.Button(self.tb['saveas'].master, text='Save map for the game', command=self.save_map)
+        self.tb['savemap'].pack(side='left', padx=(6, 3), after=self.tb['saveas']); self.tb['savemap']._label = 'Save map for the game'
         self.send_btn.pack_forget()
-        f = ttk.Frame(self.nb, padding=(6, 6)); self.nb.insert(0, f, text='Map'); self.panels['Map'] = f
+        f = self.make_panel('Map', 0); self.panels['Map'] = f
         self.nb.select(0)
         self.build_map(f)
 
@@ -109,19 +157,6 @@ class WorldEditor(HS.Studio):
         self.area_surf = tk.StringVar(value='')
         cb = ttk.Combobox(r, textvariable=self.area_surf, values=[ME.SURFACES[k][0] for k in range(8)] + ["(keep the game's ground)"], state='readonly', width=30)
         cb.pack(side='left', padx=4); cb.bind('<<ComboboxSelected>>', lambda e: self.set_area_surface(self.area_surf.get()))
-        r = ttk.Frame(f); r.pack(fill='x', pady=(4, 0))
-        ttk.Label(r, text="Track objects' texture detail:").pack(side='left')
-        self.obj_tex = tk.StringVar(value='8192 (sharpest)')
-        ttk.Combobox(r, textvariable=self.obj_tex, values=['8192 (sharpest)', '4096', '2048 (lightest)'], state='readonly',
-                     width=15).pack(side='left', padx=4)
-        ttk.Button(r, text='Remove its objects', command=self.remove_objects).pack(side='left', padx=(4, 0))
-        r = ttk.Frame(f); r.pack(fill='x', pady=(2, 0))
-        ttk.Label(r, text='Objects go into the map model:').pack(side='left')
-        self.obj_host = tk.StringVar(value=OB.HOSTS[0])
-        self.obj_host_cb = ttk.Combobox(r, textvariable=self.obj_host, values=OB.HOSTS, width=18,
-                                        postcommand=lambda: self.obj_host_cb.configure(
-                                            values=OB.host_candidates(self.tf, self.tf.spec) if self.tf else OB.HOSTS))
-        self.obj_host_cb.pack(side='left', padx=4)
         self.hint(f, 'Placing: drag the orange box, R or Turn 90° turns it, Enter confirms, Esc stops moving. '
                      'Overlapping areas: the one in front (lower in the list) wins.')
         r = ttk.Frame(f); r.pack(fill='x', pady=(4, 0))
@@ -145,15 +180,31 @@ class WorldEditor(HS.Studio):
         ttk.Label(r, text='m / pixel').pack(side='left')
         r = ttk.Frame(f); r.pack(fill='x', pady=(4, 0))
         ttk.Button(r, text='Import a heightmap image as an area…', command=self.import_area).pack(side='left')
-        self.section(f, 'MX Bikes tracks (drag a .pkz onto the map, or pick one)')
+        self.section(f, 'MX Bikes / MX Simulator tracks (drag a .pkz / .saf onto the map, or pick one)')
         r = ttk.Frame(f); r.pack(fill='x')
-        self.mxb_dir = mxb_io.default_tracks_dir()
+        self.mxb_dir = get_setting(self.app, 'mxb_tracks_dir') or mxb_io.default_tracks_dir()
         self.mxb_pick = tk.StringVar()
         self.mxb_cb = ttk.Combobox(r, textvariable=self.mxb_pick, state='readonly', width=34)
         self.mxb_cb.pack(side='left', fill='x', expand=True)
         self.mxb_cb.bind('<ButtonPress-1>', lambda e: self.fill_mxb(), add='+')
         ttk.Button(r, text='Import', command=self.import_mxb_pick).pack(side='left', padx=(4, 0))
         ttk.Button(r, text='Other…', command=lambda: self.import_mxb(None)).pack(side='left', padx=(4, 0))
+        r = ttk.Frame(f); r.pack(fill='x', pady=(2, 0))
+        ttk.Label(r, text='Tracks folder:').pack(side='left')
+        self.mxb_dir_var = tk.StringVar(value=self.mxb_dir or '(not found - pick it)')
+        ttk.Label(r, textvariable=self.mxb_dir_var, foreground='#555', width=1).pack(side='left', fill='x', expand=True, padx=4)
+        ttk.Button(r, text='Change…', command=self.pick_mxb_dir).pack(side='left')
+        ttk.Button(r, text='Default', command=lambda: self.pick_mxb_dir(default=True)).pack(side='left', padx=(3, 0))
+        r = ttk.Frame(f); r.pack(fill='x', pady=(2, 0))
+        ttk.Label(r, text='MX Simulator folder:').pack(side='left')
+        self.mxs_dir = get_setting(self.app, 'mxs_dir') or next(iter(mxs_io.default_dirs()), None)
+        self.mxs_dir_var = tk.StringVar(value=self.mxs_dir or '(not found - pick it)')
+        ttk.Label(r, textvariable=self.mxs_dir_var, foreground='#555', width=1).pack(side='left', fill='x', expand=True, padx=4)
+        ttk.Button(r, text='Change…', command=self.pick_mxs_dir).pack(side='left')
+        ttk.Button(r, text='Default', command=lambda: self.pick_mxs_dir(default=True)).pack(side='left', padx=(3, 0))
+        r = ttk.Frame(f); r.pack(fill='x', pady=(2, 0))
+        ttk.Button(r, text='Unpack a .saf…', command=self.unpack_saf).pack(side='left')
+        ttk.Label(r, text='(not needed to import - .saf tracks are read directly)', foreground='#666').pack(side='left', padx=4)
         r = ttk.Frame(f); r.pack(fill='x', pady=(4, 0))
         ttk.Label(r, text='Blend areas into the map over').pack(side='left')
         self.area_edge = tk.StringVar(value='6'); ttk.Entry(r, textvariable=self.area_edge, width=5, justify='right').pack(side='left', padx=3)
@@ -185,12 +236,25 @@ class WorldEditor(HS.Studio):
         self.nav = ttk.Frame(f); self.nav.pack(fill='x')
         self.section(f, 'The game')
         self.prog = ttk.Progressbar(f, mode='determinate'); self.prog.pack(fill='x', pady=(0, 4))
-        ttk.Button(f, text='Save new map as…', command=self.save_map).pack(fill='x')
+        self.save_dir = get_setting(self.app, 'map_save_dir') or default_save_dir()
+        r = ttk.Frame(f); r.pack(fill='x')
+        ttk.Label(r, text='Maps are saved in:').pack(side='left')
+        self.save_dir_var = tk.StringVar(value=self.save_dir)
+        ttk.Label(r, textvariable=self.save_dir_var, foreground='#555', width=1).pack(side='left', fill='x', expand=True, padx=4)
+        ttk.Button(r, text='Change…', command=self.pick_save_dir).pack(side='left')
+        ttk.Button(r, text='Open', command=lambda: self.open_folder(self.save_dir)).pack(side='left', padx=(3, 0))
+        r = ttk.Frame(f); r.pack(fill='x', pady=(4, 0))
+        b1 = ttk.Button(r, text='Save map (map.blend.bin)', command=self.save_map); b1.pack(side='left', fill='x', expand=True)
+        b2 = ttk.Button(r, text='Save map as…', command=lambda: self.save_map(ask=True))
+        b2.pack(side='left', fill='x', expand=True, padx=(4, 0))
+        self.save_btns = [b1, b2]
+        for b in self.save_btns: b._label = b.cget('text')
         r = ttk.Frame(f); r.pack(fill='x', pady=(4, 0))
         ttk.Button(r, text='Install a saved map…', command=self.install).pack(side='left', fill='x', expand=True)
         ttk.Button(r, text='Restore original', command=self.restore).pack(side='left', fill='x', expand=True, padx=(4, 0))
-        self.hint(f, "The game's map is only read. Your areas are kept between sessions; Save new map writes them "
-                     'into a copy, Install puts that copy in the game (the original is kept as map.blend.bin.orig).')
+        self.hint(f, "The game's map is only read. \"Save work\" (top) only keeps your editing for next time; "
+                     '"Save map" writes the game file (map.blend.bin) into the folder above, Install puts it in the '
+                     'game (the original is kept as map.blend.bin.orig).')
 
     # ------------------------------------------------------------------ map
     def load_map(self):
@@ -230,32 +294,73 @@ class WorldEditor(HS.Studio):
     def world_range(self):
         return T.world_range(self.t)
 
+    def _shown_layers(self):
+        """The surface the game shows in every cell of the map (worked out once)."""
+        if getattr(self, '_layers_t', None) is not self.t:
+            g = self.g; mw = self.t['material_weights']
+            self._layers = T.shown_layer(*(mw[k].reshape(g.ry, g.rx) for k in ('first', 'second', 'blend'))).astype(np.int8)
+            self._layers_t = self.t
+        return self._layers
+
     def world_image(self, W, H):
         """The map under the view (heights shaded, the game's surfaces), as a PIL image."""
         g = self.g
+        if abs(self.view_rot) > 1e-9:
+            return self._world_image_turned(W, H)
         xs = self.vx + (np.arange(W) - W / 2) * self.mpp; zs = self.vz - (np.arange(H) - H / 2) * self.mpp
         ix = np.clip(np.round((xs - g.x0) / g.dx).astype(np.int64), 0, g.rx - 1)
         iz = np.clip(np.round((zs - g.z0) / g.dz).astype(np.int64), 0, g.ry - 1)
         inside = ((xs >= g.x0) & (xs <= g.x1))[None, :] & ((zs >= g.z0) & (zs <= g.z1))[:, None]
         h = g.base[np.ix_(iz, ix)].astype(np.float32)
         if self.mpp < g.dx * 1.5:
-            Z, X = np.meshgrid(zs, xs, indexing='ij')
-            for c in self.t['height_clips']:
+            for c in self.t['height_clips']:                 # detail clips: rows / columns are separable
                 ox0, oz0, odx, odz, A = g.clip_grid(c)
+                ry, rx = A.shape
+                fx = (xs - ox0) / odx; fz = (zs - oz0) / odz
+                cx = np.nonzero((fx >= 0) & (fx <= rx - 1))[0]; cz = np.nonzero((fz >= 0) & (fz <= ry - 1))[0]
+                if not len(cx) or not len(cz): continue
+                h[np.ix_(cz, cx)] = A[np.ix_(np.round(fz[cz]).astype(np.int64), np.round(fx[cx]).astype(np.int64))]
+        mat = self._shown_layers()[np.ix_(iz, ix)]
+        void = (h <= -999) | ~inside
+        hv = np.where(void, np.float32(0), h)
+        gx = np.zeros_like(h); gz = np.zeros_like(h)
+        gx[:, 1:-1] = (hv[:, 2:] - hv[:, :-2]) * np.float32(1 / (2 * self.mpp))
+        gz[1:-1, :] = (hv[2:, :] - hv[:-2, :]) * np.float32(1 / (2 * self.mpp))
+        L = np.array([-0.5, 0.75, -0.45], np.float32); L /= np.linalg.norm(L)
+        sh = np.clip((-gx * L[0] + L[1] - gz * L[2]) / np.sqrt(gx * gx + 1 + gz * gz), 0, 1) * np.float32(0.75) + np.float32(0.35)
+        col = ME.PAL.astype(np.float32)[np.clip(mat, 0, 7)] * sh[..., None]
+        col[void] = ME.VOID
+        return Image.fromarray(np.clip(col, 0, 255).astype(np.uint8))
+
+    def _world_image_turned(self, W, H):
+        """world_image for a turned view: every screen pixel's own spot on the map."""
+        g = self.g
+        c, s_ = math.cos(self.view_rot), math.sin(self.view_rot)
+        a = ((np.arange(W, dtype=np.float32) + 0.5) - W / 2) * self.mpp
+        b = -((np.arange(H, dtype=np.float32) + 0.5) - H / 2) * self.mpp
+        X = self.vx + a[None, :] * c + b[:, None] * s_
+        Z = self.vz - a[None, :] * s_ + b[:, None] * c
+        ix = np.clip(np.round((X - g.x0) / g.dx).astype(np.int64), 0, g.rx - 1)
+        iz = np.clip(np.round((Z - g.z0) / g.dz).astype(np.int64), 0, g.ry - 1)
+        inside = (X >= g.x0) & (X <= g.x1) & (Z >= g.z0) & (Z <= g.z1)
+        h = g.base[iz, ix].astype(np.float32)
+        if self.mpp < g.dx * 1.5:
+            for cl in self.t['height_clips']:
+                ox0, oz0, odx, odz, A = g.clip_grid(cl)
                 ry, rx = A.shape
                 fx = (X - ox0) / odx; fz = (Z - oz0) / odz
                 m = (fx >= 0) & (fx <= rx - 1) & (fz >= 0) & (fz <= ry - 1)
                 if m.any(): h[m] = A[np.round(fz[m]).astype(np.int64), np.round(fx[m]).astype(np.int64)]
-        mw = self.t['material_weights']
-        mat = T.shown_layer(*(mw[k].reshape(g.ry, g.rx)[np.ix_(iz, ix)] for k in ('first', 'second', 'blend')))
+        mat = self._shown_layers()[iz, ix]
         void = (h <= -999) | ~inside
-        hv = np.where(void, 0, h)
-        gx = np.zeros_like(h); gz = np.zeros_like(h)
-        gx[:, 1:-1] = (hv[:, 2:] - hv[:, :-2]) / (2 * self.mpp); gz[1:-1, :] = (hv[2:, :] - hv[:-2, :]) / (2 * self.mpp)
-        n = np.stack([-gx, np.ones_like(h), -gz], -1); n /= np.linalg.norm(n, axis=-1, keepdims=True)
-        L = np.array([-0.5, 0.75, -0.45]); L /= np.linalg.norm(L)
-        sh = np.clip(n @ L, 0, 1) * 0.75 + 0.35
-        col = ME.PAL[np.clip(mat, 0, 7)] * sh[..., None]
+        hv = np.where(void, np.float32(0), h)
+        ga = np.zeros_like(h); gb = np.zeros_like(h)               # slopes along the screen's x and up
+        ga[:, 1:-1] = (hv[:, 2:] - hv[:, :-2]) * np.float32(1 / (2 * self.mpp))
+        gb[1:-1, :] = -(hv[2:, :] - hv[:-2, :]) * np.float32(1 / (2 * self.mpp))
+        gx = ga * c + gb * s_; gz = -ga * s_ + gb * c               # back to the map's x / z
+        L = np.array([-0.5, 0.75, -0.45], np.float32); L /= np.linalg.norm(L)
+        sh = np.clip((-gx * L[0] + L[1] - gz * L[2]) / np.sqrt(gx * gx + 1 + gz * gz), 0, 1) * np.float32(0.75) + np.float32(0.35)
+        col = ME.PAL.astype(np.float32)[np.clip(mat, 0, 7)] * sh[..., None]
         col[void] = ME.VOID
         return Image.fromarray(np.clip(col, 0, 255).astype(np.uint8))
 
@@ -264,21 +369,17 @@ class WorldEditor(HS.Studio):
         if self.area is None: return 0.0, 0.0
         pl = self.p.placement; return pl['x0'], pl['z0']
 
-    def w2c(self, x, z):
-        W, H = self.canvas.winfo_width(), self.canvas.winfo_height(); ox, oz = self.origin()
-        return (x + ox - self.vx) / self.mpp + W / 2, H / 2 - (z + oz - self.vz) / self.mpp
+    def vs_origin(self):                        # area-local (0, 0) in world metres (the view's space)
+        return self.origin()
 
-    def c2w(self, cx, cy):
-        W, H = self.canvas.winfo_width(), self.canvas.winfo_height(); ox, oz = self.origin()
-        return (cx - W / 2) * self.mpp + self.vx - ox, self.vz - (cy - H / 2) * self.mpp - oz
+    def edit3d(self):
+        return self.area is not None and super().edit3d()
 
     def to_world(self, cx, cy):
-        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
-        return (cx - W / 2) * self.mpp + self.vx, self.vz - (cy - H / 2) * self.mpp
+        return self.c2vs(cx, cy)
 
     def to_screen(self, x, z):
-        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
-        return (x - self.vx) / self.mpp + W / 2, H / 2 - (z - self.vz) / self.mpp
+        return self.vs2c(x, z)
 
     def fit(self):
         if self.g is None: return
@@ -294,7 +395,7 @@ class WorldEditor(HS.Studio):
         self.mpp *= 1 / 1.2 if up else 1.2
         self.mpp = min(max(self.mpp, 0.02), 40.0)
         nx, nz = self.to_world(e.x, e.y); self.vx += x - nx; self.vz += z - nz
-        self.render()
+        self.request_render()
 
     # ------------------------------------------------------------------ areas
     def area_rect(self, a):
@@ -560,7 +661,7 @@ class WorldEditor(HS.Studio):
             path = filedialog.askopenfilename(parent=self, title='Heightmap image (16-bit PNG is best)',
                                               filetypes=[('Images', '*.png *.tif *.tiff *.jpg *.bmp *.pgm'), ('All', '*.*')])
         if not path: return
-        if mxb_io.is_track(path): return self.import_mxb(path)
+        if mxb_io.is_track(path) or mxs_io.is_track(path): return self.import_mxb(path)
         try:
             img, levels = ME.load_heightmap(path, with_levels=True)
         except Exception as e:
@@ -596,29 +697,107 @@ class WorldEditor(HS.Studio):
                                (ih - 1) * mp, blend=8.0, mode=mode, note=os.path.basename(path), place=False)
 
     # ------------------------------------------------------------------ MX Bikes tracks
+    def pick_mxb_dir(self, default=False):
+        if default:
+            d = mxb_io.default_tracks_dir()
+            set_setting(self.app, 'mxb_tracks_dir', '')
+        else:
+            d = filedialog.askdirectory(parent=self, title="MX Bikes tracks folder (usually Documents\\PiBoSo\\MX Bikes\\mods\\tracks)",
+                                        initialdir=self.mxb_dir or os.path.expanduser('~'), mustexist=True)
+            if not d: return
+            d = os.path.normpath(d); set_setting(self.app, 'mxb_tracks_dir', d)
+        self.mxb_dir = d
+        self.mxb_dir_var.set(d or '(not found - pick it)')
+        self.fill_mxb(); self.mxb_pick.set('')
+        self.status.set('MX Bikes tracks folder: %s (%d tracks)' % (d, len(self.mxb_tracks)) if d else
+                        'No MX Bikes tracks folder found - use Change… to pick it.')
+
+    def choose(self, title, text, options):
+        """A small window with a list to pick from; returns the picked option or None."""
+        d = tk.Toplevel(self); d.title(title); d.transient(self); d.grab_set()
+        ttk.Label(d, text=text).pack(anchor='w', padx=8, pady=(8, 4))
+        lb = tk.Listbox(d, height=min(12, len(options)), width=40); lb.pack(padx=8, fill='both', expand=True)
+        for o in options: lb.insert('end', o)
+        lb.selection_set(0)
+        res = []
+        def ok(*_):
+            sel = lb.curselection()
+            if sel: res.append(options[sel[0]])
+            d.destroy()
+        lb.bind('<Double-Button-1>', ok)
+        ttk.Button(d, text='OK', command=ok).pack(pady=8)
+        self.wait_window(d)
+        return res[0] if res else None
+
+    def pick_mxs_dir(self, default=False):
+        if default:
+            d = next(iter(mxs_io.default_dirs()), None); set_setting(self.app, 'mxs_dir', '')
+        else:
+            d = filedialog.askdirectory(parent=self, title='MX Simulator folder (where its .saf tracks are, usually '
+                                        'C:\\Program Files (x86)\\MX Simulator)',
+                                        initialdir=self.mxs_dir or os.path.expanduser('~'), mustexist=True)
+            if not d: return
+            d = os.path.normpath(d); set_setting(self.app, 'mxs_dir', d)
+        self.mxs_dir = d
+        self.mxs_dir_var.set(d or '(not found - pick it)')
+        self.fill_mxb(); self.mxb_pick.set('')
+        n = sum(1 for t in self.mxb_tracks if '(MX Simulator' in t[0])
+        self.status.set('MX Simulator folder: %s (%d tracks)' % (d, n) if d else 'No MX Simulator folder found - use Change… to pick it.')
+
+    def unpack_saf(self):
+        src = filedialog.askopenfilename(parent=self, title='MX Simulator .saf to unpack', initialdir=self.mxs_dir or None,
+                                         filetypes=[('MX Simulator archive', '*.saf'), ('All', '*.*')])
+        if not src: return
+        dest = filedialog.askdirectory(parent=self, title='Unpack it into which folder?',
+                                       initialdir=os.path.dirname(src))
+        if not dest: return
+        if self.in_game_folder(os.path.join(dest, 'x')):
+            messagebox.showerror('Map editor', "Pick a folder outside Senders' game folder.", parent=self); return
+        self.status.set('Unpacking %s…' % os.path.basename(src)); self.update_idletasks()
+        try:
+            n = mxs_io.extract(src, dest)
+        except Exception as e:
+            messagebox.showerror('Map editor', "Couldn't unpack it:\n%s" % e, parent=self); return
+        self.status.set('Unpacked %d files from %s into %s' % (n, os.path.basename(src), dest))
+
     def fill_mxb(self):
-        self.mxb_tracks = mxb_io.list_tracks(self.mxb_dir) if self.mxb_dir else []
+        self.mxb_tracks = (mxb_io.list_tracks(self.mxb_dir) if self.mxb_dir else []) + \
+            (mxs_io.list_tracks(self.mxs_dir) if getattr(self, 'mxs_dir', None) else [])
         self.mxb_cb['values'] = [n + ('' if ok else '  (protected)') for n, p, ok in self.mxb_tracks] or \
-            ['(no MX Bikes tracks found - use Other…)']
+            ['(no tracks found - use Other…)']
 
     def import_mxb_pick(self):
         if not getattr(self, 'mxb_tracks', None): self.fill_mxb()
         k = self.mxb_cb.current()
         if k < 0 or k >= len(self.mxb_tracks):
-            self.status.set('Pick an MX Bikes track in the list first.'); return
+            self.status.set('Pick a track in the list first.'); return
         self.import_mxb(self.mxb_tracks[k][1])
 
     def import_mxb(self, path=None):
-        """An MX Bikes track's terrain becomes a new work area, at its real size."""
+        """An MX Bikes or MX Simulator track's terrain becomes a new work area, at its real size."""
         if self.g is None: return
         if path is None:
-            path = filedialog.askopenfilename(parent=self, title='MX Bikes track (.pkz) or terrain (.trh)',
-                                              initialdir=self.mxb_dir or None,
-                                              filetypes=[('MX Bikes track', '*.pkz *.trh'), ('All', '*.*')])
+            path = filedialog.askopenfilename(parent=self, title='MX Bikes track (.pkz / .trh) or MX Simulator track (.saf / terrain.hf)',
+                                              initialdir=self.mxb_dir or self.mxs_dir or None,
+                                              filetypes=[('Tracks', '*.pkz *.trh *.saf *.hf'), ('MX Bikes track', '*.pkz *.trh'),
+                                                         ('MX Simulator track', '*.saf *.hf'), ('All', '*.*')])
             if not path: return
         self.status.set('Reading %s…' % os.path.basename(path)); self.update_idletasks()
+        mxs = mxs_io.is_track(path)
         try:
-            t = mxb_io.load(path)
+            if mxs:
+                which = None
+                if path.lower().endswith('.saf'):
+                    tr = mxs_io.saf_tracks(path)
+                    if len(tr) > 1:
+                        which = self.choose('Which track?', 'This .saf holds several tracks:', [x.strip('/') for x in tr])
+                        if which is None: return
+                        which = tr[[x.strip('/') for x in tr].index(which)]
+                t = mxs_io.load(path, which)
+            else:
+                t = mxb_io.load(path)
+        except mxs_io.NotATrack as e:
+            messagebox.showinfo('Map editor', str(e), parent=self); self.status.set(str(e)); return
         except mxb_io.ProtectedTrack as e:
             messagebox.showinfo('Map editor', str(e) + '\n\nUnprotected tracks (and unpacked track folders) work.', parent=self)
             self.status.set(str(e)); return
@@ -641,35 +820,74 @@ class WorldEditor(HS.Studio):
         ttk.Checkbutton(d, text='Mirror it', variable=mir).grid(row=2, column=2, sticky='w')
         ttk.Label(d, text='It sits on the ground where you are looking. Raise it by (m)').grid(row=3, column=0, columnspan=2, sticky='w', padx=8)
         ttk.Entry(d, textvariable=raise_m, width=6).grid(row=3, column=2, sticky='w')
+        scale = tk.StringVar(value='100')
+        sr = ttk.Frame(d); sr.grid(row=9, column=0, columnspan=3, sticky='w', padx=8, pady=(4, 0))
+        ttk.Label(sr, text='Size').pack(side='left')
+        ttk.Entry(sr, textvariable=scale, width=5, justify='right').pack(side='left', padx=3)
+        ttk.Label(sr, text='%  (100 = true size; heights scale too)', foreground='#666').pack(side='left')
+        if mxs:
+            ttk.Button(sr, text='Match the MX Sim bike (104%)', command=lambda: scale.set('104')).pack(side='left', padx=(6, 0))
+            ttk.Label(d, text="MX Simulator's bikes have true-size wheels (0.70 / 0.665 m); Senders' bike is about 4% bigger "
+                      "(0.725 / 0.69 m). 104% keeps jumps the same size next to the bike as in MX Simulator.",
+                      foreground='#666', wraplength=460).grid(row=11, column=0, columnspan=3, sticky='w', padx=8)
         ttk.Label(d, text='It keeps its exact shape on a level pad; around its edges it meets the map over 25 m. '
                   'You can drag it into place afterwards (Enter confirms).', foreground='#666', wraplength=460).grid(row=4, column=0, columnspan=3, sticky='w', padx=8)
-        objs = tk.BooleanVar(value=not path.lower().endswith('.trh'))
-        of = ttk.LabelFrame(d, text=' Objects ')
-        of.grid(row=5, column=0, columnspan=3, sticky='we', padx=8, pady=(6, 0))
-        ttk.Checkbutton(of, text="Bring the track's objects too - fences, banners, tents, trees... with their textures",
-                        variable=objs).pack(anchor='w', padx=6, pady=(4, 0))
-        ttk.Label(of, text='They go into the map when you save it; their textures are packed into one picture that '
-                  'Install puts in the game (in place of the small backpack logo).', foreground='#666',
-                  wraplength=440).pack(anchor='w', padx=6, pady=(0, 4))
+        pv = ttk.Frame(d); pv.grid(row=5, column=0, columnspan=3, padx=8, pady=(6, 0), sticky='w')
+        c1 = tk.Canvas(pv, width=200, height=200, highlightthickness=0, background='#20242a'); c1.pack(side='left')
+        imgs = {}
+        if t.get('map_png'):
+            try:
+                from PIL import ImageTk
+                mp = Image.open(io.BytesIO(t['map_png'])).convert('RGBA'); mp.thumbnail((200, 200))
+                bg = Image.new('RGBA', mp.size, (32, 36, 42, 255)); bg.alpha_composite(mp)
+                imgs['map'] = ImageTk.PhotoImage(bg, master=d)
+                c2 = tk.Canvas(pv, width=200, height=200, highlightthickness=0, background='#20242a'); c2.pack(side='left', padx=(8, 0))
+                c2.create_image(100, 100, image=imgs['map'])
+                ttk.Label(d, text='Left: how it will sit in Senders (seen from above). Right: the track\'s own map. If '
+                          'they are mirror images, tick "Mirror it".', foreground='#666', wraplength=460).grid(
+                    row=6, column=0, columnspan=3, sticky='w', padx=8)
+            except Exception:
+                pass
+        if t.get('cropped'):
+            ttk.Label(d, text='Only the part around the track is taken (%.0f x %.0f m of the whole %.0f x %.0f m terrain).'
+                      % (t['size_x'], t['size_z'], t['full_size'][0], t['full_size'][1]), foreground='#666',
+                      wraplength=460).grid(row=7, column=0, columnspan=3, sticky='w', padx=8)
+
+        def preview(*_):
+            try:
+                from PIL import ImageTk
+                hh, _sw = mxb_io.orient(h, int(rot.get()), mir.get())
+                step = max(1, max(hh.shape) // 200)
+                sm = hh[::step, ::step]
+                rgb = C.shade(sm, step * t['size_x'] / max(h.shape[1] - 1, 1))
+                im = Image.fromarray(rgb[::-1])                 # z up the screen, like the map view
+                im.thumbnail((200, 200)); imgs['h'] = ImageTk.PhotoImage(im, master=d)
+                c1.delete('all'); c1.create_image(100, 100, image=imgs['h'])
+            except Exception:
+                pass
+        rot.trace_add('write', preview); mir.trace_add('write', preview); preview()
         res = {}
 
         def ok():
-            try: res.update(rot=int(rot.get()), mir=mir.get(), up=float(raise_m.get() or 0), surf=surf.get(), objs=objs.get())
+            try: res.update(rot=int(rot.get()), mir=mir.get(), up=float(raise_m.get() or 0), surf=surf.get(),
+                            scale=max(10.0, min(400.0, float(scale.get() or 100))) / 100.0)
             except ValueError: return
             d.destroy()
-        ttk.Button(d, text='Import', command=ok).grid(row=6, column=0, columnspan=3, pady=8)
+        ttk.Button(d, text='Import', command=ok).grid(row=12, column=0, columnspan=3, pady=8)
         d.bind('<Return>', lambda e: ok())
         self.wait_window(d)
         if not res: return
         h, swap = mxb_io.orient(h, res['rot'], res['mir'])
         wm, lm = (t['size_z'], t['size_x']) if swap else (t['size_x'], t['size_z'])
-        self.area_from_heights(t['name'], h, wm, lm, rise=res['up'], blend=25.0, flat=True, source='mxb',
-                               note='MX Bikes track %s (%.0f x %.0f m)' % (t['name'], wm, lm))
+        k = res.get('scale', 1.0)
+        if abs(k - 1.0) > 1e-6:
+            h = h * k; wm *= k; lm *= k
+        self.area_from_heights(t['name'], h, wm, lm, rise=res['up'], blend=25.0, flat=True, source='mxs' if mxs else 'mxb',
+                               note='%s track %s (%.0f x %.0f m)' % ('MX Simulator' if mxs else 'MX Bikes', t['name'], wm, lm))
         if self.area is not None and self.area['name'] == t['name'] and res.get('surf'):
             msg = self.status.get(); self.set_area_surface(res['surf']); self.area_surf.set(res['surf']); self.status.set(msg)
         if self.area is not None and self.area['name'] == t['name']:
             self.p.terrain['import']['handed'] = 2
-            if res.get('objs'): self.add_objects(path, t, res['rot'], res['mir'])
 
     def area_from_heights(self, name, h, wm, lm, rise=0.0, blend=15.0, note='', mode='relative', place=True, flat=False,
                           source=''):
@@ -752,82 +970,11 @@ class WorldEditor(HS.Studio):
             self.p.base_img = self.compose_base(self.p); self.area['objmask'] = None
         super().after_undo()
 
-    # ------------------------------------------------------------------ MX Bikes objects
-    def add_objects(self, path, t, rot, mirror):
-        self.status.set('Reading the objects of %s…' % t['name']); self.update_idletasks()
-        try:
-            d = OB.load(path); sm = OB.summary(d)
-        except Exception as e:
-            self.status.set("Imported the terrain - its objects couldn't be read: %s" % e); return
-        self.p.terrain['objects'] = {'path': os.path.abspath(path), 'rot': int(rot) % 360, 'mirror': bool(mirror),
-                                     'sx': float(t['size_x']), 'sz': float(t['size_z']), 'skip_ground': True,
-                                     'count': sm['triangles'], 'textures': sm['textures']}
-        self.area['objmask'] = None; self._mask_dirty = True; self.reshade(); self.autosave_ws()
-        self.status.set('Imported %s with its objects (%d triangles, %d textures%s). Drag it into place, then Confirm '
-                        'placement; Save new map writes the objects too.'
-                        % (t['name'], sm['triangles'], sm['textures'],
-                           ', %d ground / backdrop surfaces left out' % sm['ground'] if sm['ground'] else ''))
-
-    def objects_host(self, spec):
-        """The map model the objects are put into (the game only loads the models its map was made with)."""
-        names = OB.host_candidates(self.tf, spec)
-        want = self.obj_host.get() if hasattr(self, 'obj_host') else ''
-        name = want if want in names else (names[0] if names else None)
-        return next((n for n in self.tf.nodes if n.get('name') == name), None) if name else None
-
-    def remove_objects(self):
-        if self.area is None or not self.p.terrain.get('objects'):
-            self.status.set('This area has no MX Bikes objects.'); return
-        self.hist.push_state(); self.p.terrain.pop('objects', None); self.area['objmask'] = None
-        self._mask_dirty = True; self.reshade(); self.autosave_ws()
-        self.status.set("Removed this area's objects (Undo brings them back).")
-
-    def objects_part(self, a, world=True):
-        """The area's MX Bikes objects placed (world coordinates, or area-local with world=False), or None."""
-        p = a['p']; ob = p.terrain.get('objects'); imp = p.terrain.get('import')
-        if not ob or not imp: return None
-        d = OB.load(ob['path'])
-        ox = (p.size - imp['wm']) / 2; oz = (p.size - imp['lm']) / 2
-        part = OB.placed(d, ob['rot'], ob['mirror'], ob['sx'], ob['sz'], (ox, 0.0, oz), ob.get('skip_ground', True), key=ob['path'])
-        keep = getattr(p, 'impkeep', None)
-        if keep is not None and (keep < 0.5).any():          # erased parts of the track lose their objects too
-            c = part['P'][part['I']].mean(1)
-            ci = np.clip(np.round(c[:, 0] / p.px).astype(np.int64), 0, p.n - 1)
-            ri = np.clip(np.round(c[:, 2] / p.px).astype(np.int64), 0, p.n - 1)
-            ok = keep[ri, ci] >= 0.5
-            part['I'] = part['I'][ok]; part['tri_mat'] = part['tri_mat'][ok]
-        if world: part['P'] = part['P'] + np.array([p.placement['x0'], imp.get('shift', 0.0), p.placement['z0']])
-        return part
-
-    def area_objmask(self, a):
-        p = a['p']; ob = p.terrain.get('objects')
-        if not ob: return None
-        key = (ob['path'], ob['rot'], ob['mirror'], p.n, p.px, p.terrain['import']['wm'], float(p.impkeep.sum()))
-        if a.get('objmask') is not None and a.get('okey') == key: return a['objmask']
-        m = np.zeros((p.n, p.n), bool)
-        try:
-            part = self.objects_part(a, world=False)
-            V = part['P'][np.unique(part['I'])]
-            c = np.round(V[:, 0] / p.px).astype(np.int64); r = np.round(V[:, 2] / p.px).astype(np.int64)
-            ok = (c >= 0) & (c < p.n) & (r >= 0) & (r < p.n)
-            m[r[ok], c[ok]] = True
-            m[1:] |= m[:-1].copy(); m[:, 1:] |= m[:, :-1].copy()
-        except Exception as e:
-            self.status.set("The track's objects can't be shown: %s" % e)
-        a['objmask'] = m; a['okey'] = key
-        return m
-
     def draw_nature(self, rgb, win):
         super().draw_nature(rgb, win)
         if self.area is not None and self.p.terrain.get('import') and self.tab() == 'Sculpt':
             k = (1 - np.clip(self.p.impkeep[win], 0, 1))[..., None] * 0.55     # erased parts of the import: blue
             if k.max() > 0: rgb[:] = (rgb * (1 - k) + np.array([60, 120, 230]) * k).astype(np.uint8)
-        if self.area is None or not self.p.terrain.get('objects'): return
-        if not (getattr(self, 'show_nature', None) is None or self.show_nature.get()): return
-        m = self.area_objmask(self.area)
-        if m is not None:
-            sub = m[win]
-            rgb[sub] = (rgb[sub] * 0.25 + np.array([40, 44, 58]) * 0.75).astype(np.uint8)
 
     def compose_base(self, p):
         """The area's terrain: the game's ground where it is now, with the imported heights (if any) on it."""
@@ -993,10 +1140,10 @@ class WorldEditor(HS.Studio):
         try: files = self.tk.splitlist(e.data)
         except Exception: files = [e.data]
         for f in files[:1]:
-            if mxb_io.is_track(f): self.after(10, lambda f=f: self.import_mxb(f))
+            if mxb_io.is_track(f) or mxs_io.is_track(f): self.after(10, lambda f=f: self.import_mxb(f))
             elif f.lower().endswith(('.png', '.tif', '.tiff', '.jpg', '.jpeg', '.bmp', '.pgm')): self.after(10, lambda f=f: self.import_area(f))
             elif f.lower().endswith('.hmworld'): self.after(10, lambda f=f: self.open_workspace(f))
-            else: self.status.set("That file isn't an MX Bikes track, a heightmap image or saved map work.")
+            else: self.status.set("That file isn't an MX Bikes / MX Simulator track, a heightmap image or saved map work.")
         return getattr(e, 'action', 'copy')
 
     # ------------------------------------------------------------------ evaluation / views
@@ -1011,9 +1158,9 @@ class WorldEditor(HS.Studio):
         self.area['pil'] = self.pil
         self.autosave_ws()
 
-    def push_gl(self, throttle=False):
+    def push_gl(self, throttle=False, win=None):
         if self.area is None: return
-        super().push_gl(throttle)
+        super().push_gl(throttle, win)
 
     def schedule_context(self):
         if self._ctx_job: self.after_cancel(self._ctx_job)
@@ -1038,59 +1185,76 @@ class WorldEditor(HS.Studio):
         rgb = C.shade(h, cs / (cn - 1), surface=mat, slope_tint=False, palette=ME.PAL)
         self.gl.set_context(h, rgb, -s, -s, cs)
 
-    def render(self):
-        c = self.canvas
-        if not c.winfo_ismapped(): return
-        W, H = c.winfo_width(), c.winfo_height()
-        if W < 4 or H < 4: return
-        if self.g is None:
-            c.delete('all'); c.create_text(W / 2, H / 2, text='Loading the map…', fill='#ccc'); return
-        key = (round(self.vx, 4), round(self.vz, 4), round(self.mpp, 6), W, H)
+    def compose(self, bx0, by0, bx1, by1):
+        """The picture for the screen box (bx0, by0)-(bx1, by1): the game's map with the work areas on it."""
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        key = (round(self.vx, 4), round(self.vz, 4), round(self.mpp, 6), W, H, round(self.view_rot, 6))
         if key != self._bg_key:
             self._bg = self.world_image(W, H); self._bg_key = key
-        img = self._bg.copy()
+        img = self._bg.crop((bx0, by0, bx1, by1)) if (bx0, by0, bx1, by1) != (0, 0, W, H) else self._bg.copy()
         mv = self._drag['off'] if (self._drag and self._drag.get('kind') == 'move_area') else (0.0, 0.0)
         for a in [b for b in self.areas if b is not self.area] + ([self.area] if self.area else []):
             pil = self.pil if a is self.area else a.get('pil')
             if pil is None: continue
             x0, z0, x1, z1 = self.area_rect(a)
             if a is self.area: x0, z0, x1, z1 = x0 + mv[0], z0 + mv[1], x1 + mv[0], z1 + mv[1]
-            sx0, sy0 = self.to_screen(x0, z1); sx1, sy1 = self.to_screen(x1, z0)    # screen top-left / bottom-right
-            bx0, by0 = max(0, int(math.floor(sx0))), max(0, int(math.floor(sy0)))
-            bx1, by1 = min(W, int(math.ceil(sx1))), min(H, int(math.ceil(sy1)))
-            if bx1 - bx0 < 1 or by1 - by0 < 1: continue
+            corners = [self.to_screen(x, z) for x, z in ((x0, z0), (x1, z0), (x1, z1), (x0, z1))]
+            ax0 = max(bx0, int(math.floor(min(p[0] for p in corners)))); ax1 = min(bx1, int(math.ceil(max(p[0] for p in corners))))
+            ay0 = max(by0, int(math.floor(min(p[1] for p in corners)))); ay1 = min(by1, int(math.ceil(max(p[1] for p in corners))))
+            if ax1 - ax0 < 1 or ay1 - ay0 < 1: continue
             px = a['p'].px
-            ext = ((self.to_world(bx0, by0)[0] - x0) / px, (self.to_world(bx0, by0)[1] - z0) / px,
-                   (self.to_world(bx1, by1)[0] - x0) / px, (self.to_world(bx1, by1)[1] - z0) / px)
-            reg = pil.transform((bx1 - bx0, by1 - by0), Image.EXTENT, ext,
-                                resample=Image.BILINEAR if self.mpp > px else Image.NEAREST)
+            data = self.affine((ax0, ay0), 1 / px, 1 / px, x0, z0)
+            rs = Image.BILINEAR if self.mpp > px else Image.NEAREST
+            reg = pil.transform((ax1 - ax0, ay1 - ay0), Image.AFFINE, data, resample=rs)
+            mask = None
+            if abs(self.view_rot) > 1e-9:                           # a turned area doesn't fill its box
+                mask = Image.new('L', pil.size, 255).transform(reg.size, Image.AFFINE, data, resample=Image.NEAREST, fillcolor=0)
             if a is self.area and self.p.reference.get('visible') and self.p.reference.get('path'):
                 try:
                     if self.ref_img is None or self.ref_img[0] != self.p.reference['path']:
                         self.ref_img = (self.p.reference['path'], Image.open(self.p.reference['path']).convert('RGB'))
                     ri = self.ref_img[1]; sxr, syr = ri.width / self.p.size, ri.height / self.p.size
-                    e2 = (ext[0] * px * sxr, ext[1] * px * syr, ext[2] * px * sxr, ext[3] * px * syr)
-                    reg = Image.blend(reg, ri.transform(reg.size, Image.EXTENT, e2, resample=Image.BILINEAR),
-                                      float(self.p.reference.get('opacity', 0.5)))
+                    r2 = ri.transform(reg.size, Image.AFFINE, self.affine((ax0, ay0), sxr, syr, x0, z0), resample=Image.BILINEAR)
+                    reg = Image.blend(reg, r2, float(self.p.reference.get('opacity', 0.5)))
                 except Exception:
                     pass
-            img.paste(reg, (bx0, by0))
+            if mask is not None:
+                img.paste(reg, (ax0 - bx0, ay0 - by0), mask); continue
+            img.paste(reg, (ax0 - bx0, ay0 - by0))
+        return img
+
+    def patch_render(self, win):
+        if self._drag and self._drag.get('kind') == 'move_area': return False
+        return super().patch_render(win)
+
+    def render(self):
+        c = self.canvas
+        if not c.winfo_ismapped(): return
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 4 or H < 4: return
+        self._cancel_render()
+        if self.g is None:
+            c.delete('all'); c.create_text(W / 2, H / 2, text='Loading the map…', fill='#ccc'); return
+        mv = self._drag['off'] if (self._drag and self._drag.get('kind') == 'move_area') else (0.0, 0.0)
+        img = self.compose(0, 0, W, H)
+        self._shown = img
         from PIL import ImageTk
         self._tk = ImageTk.PhotoImage(img)
         c.delete('all'); c.create_image(0, 0, image=self._tk, anchor='nw')
         for i, cl in enumerate(self.t['height_clips']):
             b = cl['bounds']
-            x0, y0 = self.to_screen(b['min'][0], b['min'][2]); x1, y1 = self.to_screen(b['max'][0], b['max'][2])
-            c.create_rectangle(x0, y0, x1, y1, outline='#56d1ff', dash=(5, 3))
-            c.create_text(x0 + 4, y0 + 4, anchor='nw', text='game track %d' % (i + 1), fill='#56d1ff')
+            pts = self.poly_of(b['min'][0], b['min'][2], b['max'][0], b['max'][2])
+            c.create_polygon(*pts, outline='#56d1ff', fill='', dash=(5, 3))
+            tx, ty = self.to_screen(b['min'][0], b['max'][2])
+            c.create_text(tx + 4, ty + 4, anchor='nw', text='game track %d' % (i + 1), fill='#56d1ff')
         for a in self.areas:
             x0, z0, x1, z1 = self.area_rect(a)
             on = a is self.area
             if on: x0, z0, x1, z1 = x0 + mv[0], z0 + mv[1], x1 + mv[0], z1 + mv[1]
-            p0 = self.to_screen(x0, z1); p1 = self.to_screen(x1, z0)        # top-left / bottom-right on screen
+            p0 = self.to_screen(x0, z1)                                        # the area's north-west corner
             placing = on and getattr(self, 'placing', False)
-            c.create_rectangle(*p0, *p1, outline='#ff8a2a' if placing else ('#ffd60a' if on else '#c8a848'),
-                               width=3 if placing else (2 if on else 1), dash=() if on else (4, 3))
+            c.create_polygon(*self.poly_of(x0, z0, x1, z1), fill='', outline='#ff8a2a' if placing else ('#ffd60a' if on else '#c8a848'),
+                             width=3 if placing else (2 if on else 1), dash=() if on else (4, 3))
             lab = a['name'] + ('   - drag to move, then Confirm placement' if placing else '') + \
                 ('   (rocks & trees cleared)' if a['p'].terrain.get('clear_all') and not placing else '')
             c.create_text(p0[0] + 4, p0[1] - 2, anchor='sw', text=lab, fill='#ff8a2a' if placing else ('#ffd60a' if on else '#c8a848'))
@@ -1102,6 +1266,8 @@ class WorldEditor(HS.Studio):
             self.draw_overlays(c, W, H)
         else:
             self._scale_bar(c, W, H)
+        self.draw_compass(c, W, H)
+        self._rendered()
 
     def _scale_bar(self, c, W, H):
         L = 10 ** math.floor(math.log10(max(self.mpp * 120, 1e-3)))
@@ -1175,7 +1341,7 @@ class WorldEditor(HS.Studio):
     def on_drag(self, e):
         d = self._drag
         if d and d.get('kind') == 'move_area':
-            x, z = self.to_world(e.x, e.y); d['off'] = (x - d['start'][0], z - d['start'][1]); self.render(); return
+            x, z = self.to_world(e.x, e.y); d['off'] = (x - d['start'][0], z - d['start'][1]); self.request_render(); return
         if d and d.get('kind') == 'point' and self.area is not None:
             x, z = self.to_world(e.x, e.y)
             if not self._near_area(x, z, 0) and self._near_area(x, z, 250):
@@ -1234,7 +1400,8 @@ class WorldEditor(HS.Studio):
                     info['areas'].append({'name': a['name'], 'file': 'area_%d.hmproj' % k, 'active': a is self.area})
                 z.writestr('workspace.json', json.dumps(info, indent=1))
             os.replace(tmp, path)
-            if not quiet: self.status.set('Saved your work to %s' % path)
+            if not quiet: self.status.set('Kept your map work for next time (%s). This is not the game map - use '
+                                          '"Save map for the game" for that.' % path)
         except OSError as e:
             if not quiet: messagebox.showerror('Map editor', "Couldn't save:\n%s" % e, parent=self)
 
@@ -1245,6 +1412,7 @@ class WorldEditor(HS.Studio):
                 areas = []
                 for d in info['areas']:
                     p = C.Project.open(io.BytesIO(z.read(d['file'])))
+                    p.terrain.pop('objects', None)         # track objects are switched off for now
                     areas.append(({'name': d['name'], 'p': p, 'hist': HS.History(self), 'pil': None}, d.get('active')))
         except Exception as e:
             messagebox.showerror('Map editor', "Couldn't open it:\n%s" % e, parent=self); return
@@ -1343,13 +1511,39 @@ class WorldEditor(HS.Studio):
         pass
 
     # ------------------------------------------------------------------ writing the game map
-    def save_map(self):
-        if self.t is None or self._busy: return
-        if not self.areas:
+    def pick_save_dir(self):
+        d = filedialog.askdirectory(parent=self, title='Folder to save maps in', initialdir=self.save_dir, mustexist=True)
+        if not d: return
+        d = os.path.normpath(d)
+        if self.in_game_folder(os.path.join(d, 'map.blend.bin')):
+            messagebox.showerror('Map editor', "Pick a folder outside the game's folder.", parent=self); return
+        self.save_dir = d; self.save_dir_var.set(d); set_setting(self.app, 'map_save_dir', d)
+
+    def open_folder(self, d, select=None):
+        try:
+            if sys.platform.startswith('win'):
+                if select: subprocess.Popen(['explorer', '/select,', os.path.normpath(select)])
+                else: os.startfile(d)
+            else:
+                subprocess.Popen(['xdg-open' if sys.platform.startswith('linux') else 'open', d])
+        except Exception as e:
+            self.status.set("Couldn't open the folder: %s" % e)
+
+    def save_map(self, ask=False):
+        if self._busy:
+            self.status.set('Still working on the last save…'); return
+        if self.t is None:
+            self.status.set('The map is still loading.'); return
+        if not self.areas and not getattr(self, 'flat', {}).get('on'):
             messagebox.showinfo('Map editor', 'Nothing to save yet - edit the map first.', parent=self); return
-        out = filedialog.asksaveasfilename(parent=self, title='Save the new map as', defaultextension='.bin',
-                                           initialfile='map.blend.bin', filetypes=[('Game map', '*.bin')])
-        if not out: return
+        if ask or not os.path.isdir(self.save_dir):
+            out = filedialog.asksaveasfilename(parent=self, title='Save the new map as', defaultextension='.bin',
+                                               initialdir=self.save_dir if os.path.isdir(self.save_dir) else None,
+                                               initialfile='map.blend.bin', filetypes=[('Game map', '*.bin')])
+            if not out: return
+            out = os.path.normpath(out)
+        else:
+            out = os.path.join(self.save_dir, 'map.blend.bin')
         if self.in_game_folder(out):
             messagebox.showerror('Map editor', "Save it outside the game's folder (Documents, Desktop…) - then use "
                                  "\"Install a saved map\", which keeps a backup of the game's map and only replaces it "
@@ -1370,10 +1564,8 @@ class WorldEditor(HS.Studio):
             pl.clear_all = bool(p.terrain.get('clear_all'))
             if (p.canopy >= 0).any(): pl.canopy = p.canopy.copy()
             if (p.rocks >= 0).any(): pl.rocks = p.rocks.copy()
+            if (p.smix >= 0).any(): pl.smix = p.smix.copy()
             places.append(pl)
-        obj_areas = [a for a in self.areas if a['p'].terrain.get('objects')]
-        try: A = int(self.obj_tex.get().split()[0])
-        except (ValueError, AttributeError, IndexError): A = 8192
         self._busy = True; logs = []
 
         def prog(done, total): self.after(0, lambda: self.prog.configure(value=100.0 * done / max(total, 1)))
@@ -1382,39 +1574,24 @@ class WorldEditor(HS.Studio):
             try:
                 t = self.t
                 spec = self.tf.spec
-                extra = None; atlas = None
-                if obj_areas:
-                    parts = []
-                    for a in obj_areas:
-                        self.after(0, lambda nm=a['name']: self.status.set('Reading the objects of %s…' % nm))
-                        parts.append(self.objects_part(a))
-
-                    def oprog(what, i, k):
-                        self.after(0, lambda: self.status.set('Objects: packing textures %d / %d…' % (i, k) if what == 'textures'
-                                                              else 'Objects: building models…'))
-                    hn = self.objects_host(spec)
-                    if hn is None: raise ValueError("the map has no model the objects could go into")
-                    atlas, host_bytes = OB.build_into(parts, spec, OB.decode_node(self.tf, spec, hn), A,
-                                                      progress=oprog, log=logs.append)
-                    extra = {hn['name']: host_bytes}
                 for pl in places: T.apply_placement(t, pl, log=logs.append)
                 part = out + '.part'
                 self.after(0, lambda: self.status.set('Writing the map…'))
-                self.tf.save(part, {t['node']: t}, progress=prog, replace_nodes=extra)
+                self.tf.save(part, {t['node']: t}, progress=prog)
                 chk = T.TerrainFile.open(part, spec); n = len(chk.terrains[0]['height_clips']); chk.close(); del chk
-                side = out + '.objects.png'
-                if atlas is not None:
-                    self.after(0, lambda: self.status.set('Writing the objects\' texture…'))
-                    OB.save_png(side + '.part', atlas); atlas = None
-                    os.replace(side + '.part', side)
-                elif os.path.exists(side):
-                    os.remove(side)                        # an old one would no longer match this map
+                try: os.remove(out + '.objects.png')       # left by the old track-objects feature
+                except OSError: pass
+                for side in ('.ground.json',):              # left by the removed ground-texture feature
+                    try: os.remove(out + side)
+                    except OSError: pass
                 os.replace(part, out)                      # only a checked, complete file gets the real name
                 self.tf.close()
                 tf = self.open_terrain(spec)
                 self.after(0, lambda: self.map_saved(tf, out, n, logs))
             except Exception as e:
-                msg = str(e)
+                import traceback as _tb
+                msg = str(e) or type(e).__name__
+                log_error('Saving the map to %s failed:\n%s' % (out, _tb.format_exc()))
                 try: os.remove(out + '.part')
                 except OSError: pass
                 try:
@@ -1423,38 +1600,67 @@ class WorldEditor(HS.Studio):
                     tf = None
 
                 def fail():
-                    self._busy = False
+                    self._busy = False; self.set_saving(False)
                     try:
-                        if not self.winfo_exists(): return
+                        alive = bool(self.winfo_exists())
                     except tk.TclError:
+                        alive = False
+                    if not alive:
+                        if tf is not None: tf.close()
                         return
                     if tf is not None: self.tf, self.t = tf, tf.terrains[0]; self.g = T.Grid(self.t)
-                    self.status.set("Couldn't save."); messagebox.showerror('Map editor', "Couldn't save:\n%s" % msg, parent=self)
+                    self.prog.configure(value=0)
+                    self.status.set("Couldn't save the map - nothing was written. %s" % msg)
+                    messagebox.showerror('Map editor', "Couldn't save the map (nothing was written to\n%s):\n\n%s\n\n"
+                                         "Details are in studio_errors.log." % (out, msg), parent=self)
+                    if getattr(self, '_close_after_save', False): self._close_after_save = False
                 self.after(0, fail)
-        self.status.set('Saving the new map…'); threading.Thread(target=work, daemon=True).start()
+        self._close_after_save = False; self.set_saving(True)
+        self.status.set('Saving the map to %s… (takes a while - keep the editor open until it says Saved)' % out)
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_saving(self, on):
+        for b in getattr(self, 'save_btns', []) + ([self.tb['savemap']] if 'savemap' in getattr(self, 'tb', {}) else []):
+            try: b.configure(state='disabled' if on else 'normal', text=b._label + (' (saving…)' if on else ''))
+            except (tk.TclError, AttributeError): pass
 
     def map_saved(self, tf, out, n, logs):
-        self._busy = False
+        self._busy = False; self.set_saving(False)
         try:
-            if not self.winfo_exists(): return
+            alive = bool(self.winfo_exists())
         except tk.TclError:
-            return
+            alive = False
+        if not alive:
+            tf.close(); return
+        if getattr(self, '_close_after_save', False):
+            self.tf = tf; self.last_saved = out
+            messagebox.showinfo('Map editor', 'Map saved:\n%s' % out, parent=self)
+            self.close(); return
         self.tf, self.t = tf, tf.terrains[0]; self.g = T.Grid(self.t)
         self.last_saved = out
         warns = [l[5:] for l in logs if l.startswith('WARN')]
-        self.status.set('Saved %s (checked: it reads back with %d detail clips). Use "Install a saved map" to put it in '
-                        'the game.%s' % (os.path.basename(out), n, ('  ⚠ ' + '  ⚠ '.join(warns)) if warns else ''))
+        import time as _t
+        try: mb = os.path.getsize(out) / 1e6
+        except OSError: mb = 0
+        self.status.set('Saved the map to %s at %s (%.0f MB, checked: %d detail clips). Use "Install a saved map" to put '
+                        'it in the game.%s' % (out, _t.strftime('%H:%M:%S'), mb, n, ('  ⚠ ' + '  ⚠ '.join(warns)) if warns else ''))
         self.prog.configure(value=0); self._bg_key = None; self.render()
+        if messagebox.askyesno('Map editor', 'Map saved:\n%s\n(%.0f MB, %s)\n\nInstall it in the game now? (the original '
+                               'is kept as map.blend.bin.orig)' % (out, mb, _t.strftime('%H:%M:%S')), parent=self):
+            self.install(out)
 
-    def install(self):
+    def install(self, src=None):
         if not self.game_root:
             messagebox.showinfo('Map editor', "Copy your saved map over the game's content\\meshes\\map.blend.bin "
                                 "(keep a copy of the original).", parent=self); return
-        src = filedialog.askopenfilename(parent=self, title='The map you saved', initialfile=getattr(self, 'last_saved', ''),
-                                         filetypes=[('Game map', '*.bin')])
+        asked = src is not None
+        if src is None:
+            last = getattr(self, 'last_saved', '') or os.path.join(self.save_dir, 'map.blend.bin')
+            src = filedialog.askopenfilename(parent=self, title='The map you saved', initialdir=os.path.dirname(last),
+                                             initialfile=os.path.basename(last), filetypes=[('Game map', '*.bin')])
         if not src: return
         dst = self.map_path
-        if not messagebox.askyesno('Map editor', "Replace the game's map with\n%s ?\n\nThe original is kept as "
+        if not asked and not messagebox.askyesno('Map editor', "Replace the game's map with\n%s ?\n\nThe original is kept as "
                                    'map.blend.bin.orig - "Restore original" puts it back.' % src, parent=self):
             return
         bad = self.check_map_file(src)
@@ -1466,25 +1672,31 @@ class WorldEditor(HS.Studio):
                 safe_copy(dst, dst + '.orig')
             if self.tf: self.tf.close()
             self.tf = None
-            tex = self.slot_path(); side = src + '.objects.png'
-            if tex and os.path.exists(side):              # the objects' texture goes in with the map
-                if os.path.getsize(tex) > 0 and not os.path.exists(tex + '.orig'): safe_copy(tex, tex + '.orig')
-                safe_copy(side, tex)
-            elif tex and os.path.exists(tex + '.orig'):    # a map without objects: the game's own picture back
+            tex = self.slot_path()
+            if tex and os.path.exists(tex + '.orig'):      # undo the old track-objects feature: the backpack logo back
                 safe_copy(tex + '.orig', tex)
+            self.restore_textures()
             safe_copy(src, dst)
-            self.status.set('Installed%s. Start the game to ride it. (Steam "verify files" also restores the original.)'
-                            % (' with the objects\' texture' if os.path.exists(side) else ''))
+            self.status.set('Installed. Start the game to ride it. (Steam "verify files" also restores the original.)')
             self.load_map_keep()
         except OSError as e:
             messagebox.showerror('Map editor', "Couldn't install (the game's map was left as it was):\n%s\n\n"
                                  "Is the game still running?" % e, parent=self)
             if self.tf is None: self.load_map_keep()
 
+    def restore_textures(self):
+        """Put back game textures an earlier version of the tool replaced (Sand ground, backpack logo)."""
+        if not self.game_root: return
+        d = os.path.join(self.game_root, 'content', 'terrain-tiling')
+        names = [os.path.join(d, 'sand_%s.generated.%s' % (k, e)) for k, e in
+                 (('diffuse', 'png'), ('diffuse', 'jpg'), ('height', 'png'), ('material', 'png'), ('normal', 'png'))]
+        for f in names:
+            if os.path.exists(f + '.orig'): safe_copy(f + '.orig', f)
+
     def slot_path(self):
-        """The game texture file the objects' atlas replaces."""
+        """The backpack logo texture an older version replaced with the track objects' textures."""
         if not self.game_root: return None
-        p = os.path.join(self.game_root, 'content', 'model-textures', OB.SLOT_FILE)
+        p = os.path.join(self.game_root, 'content', 'model-textures', 'logo-transparent.png')
         return p if os.path.exists(p) else None
 
     def in_game_folder(self, path):
@@ -1516,6 +1728,10 @@ class WorldEditor(HS.Studio):
         threading.Thread(target=work, daemon=True).start()
 
     def map_loaded_keep(self, tf, reseat=False):
+        try:
+            if not self.winfo_exists(): tf.close(); return
+        except tk.TclError:
+            tf.close(); return
         self.tf, self.t = tf, tf.terrains[0]; self.g = T.Grid(self.t); self._bg_key = None
         self.fill_nav()
         if reseat: self.reseat_all()
@@ -1601,11 +1817,19 @@ class WorldEditor(HS.Studio):
             safe_copy(dst + '.orig', dst)
             tex = self.slot_path()
             if tex and os.path.exists(tex + '.orig'): safe_copy(tex + '.orig', tex)
+            self.restore_textures()
             self.status.set('Original map restored.'); self.load_map_keep()
         except OSError as e:
             messagebox.showerror('Map editor', "Couldn't restore:\n%s" % e, parent=self)
 
     def close(self):
+        if self._busy:
+            if not messagebox.askyesno('Map editor', 'The map is still being saved (see the bar in the Map tab).\n\n'
+                                       'Close the editor as soon as it is done?\n(No = keep it open)', parent=self):
+                return
+            self._close_after_save = True
+            self.status.set('Will close when the save is done…')
+            return
         try:
             if self.areas: self.save_workspace(self.ws_path, quiet=True)
         except Exception:

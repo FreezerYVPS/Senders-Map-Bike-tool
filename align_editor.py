@@ -38,13 +38,21 @@ NONE = '(not exported)'
 OWN = '(my own material)'
 
 
+BIG_PARTS = ['frame', 'handlebars.top', 'handlebars.bottom', 'swingarm']
+BIG_NAMES = {'MX Bikes': {'frame': 'chassis', 'handlebars.top': 'steering', 'handlebars.bottom': 'front suspension',
+                          'swingarm': 'rear suspension'},
+             'MX Simulator': {'frame': 'frame', 'handlebars.top': 'fork upper + bars', 'handlebars.bottom': 'fork lower',
+                              'swingarm': 'swingarm'}}
+
+
 def _rgb255(c):
     return tuple(int(max(0, min(1, x)) * 255) for x in c[:3])
 
 
 class AlignEditor(tk.Toplevel):
-    def __init__(self, app, blend, model, data, map_path):
+    def __init__(self, app, blend, model, data, map_path, start_mode='lineup'):
         super().__init__(app)
+        self.start_mode = start_mode
         self.app, self.blend, self.model, self.map_path = app, blend, model, map_path
         self.mapping = data['mapping']
         self.mapping.setdefault('adjust', {}); self.mapping.setdefault('piece_adjust', {})
@@ -57,7 +65,7 @@ class AlignEditor(tk.Toplevel):
         self.model_pivot = data.get('model_pivot') or [0, 0, 0]
         self.dirty = False
         self.title('Edit model: %s → %s' % (os.path.basename(blend), model))
-        self.geometry('1320x860'); self.minsize(1050, 660)
+        self.geometry('1500x900'); self.minsize(1100, 680)
         self.units = [u['base'] for u in self.mapping['units'] if u['kind'] == 'mesh']
         self.color = {u: PALETTE[i % len(PALETTE)] for i, u in enumerate(self.units)}
         for p in self.pieces:
@@ -71,7 +79,7 @@ class AlignEditor(tk.Toplevel):
         self.sel_pieces = set()
         self.mode = tk.StringVar(value='align')
         self.yaw, self.pitch, self.zoom, self.pan = -90.0, 0.0, None, [0.0, 0.0]
-        self.show_ref = tk.BooleanVar(value=False)
+        self.show_ref = tk.BooleanVar(value=True)       # the original to line up against, on from the start
         self.ref_on_top = tk.BooleanVar(value=False)
         self.only_sel = tk.BooleanVar(value=False)
         self.show_help = tk.BooleanVar(value=True)
@@ -84,23 +92,57 @@ class AlignEditor(tk.Toplevel):
         self.ref_unit = {sp['node']: u['base'] for u in self.mapping['units'] if u['kind'] == 'mesh'
                          for sp in u['splits']}
         self._box = None
+        self.import_family = self.family()
+        # imported bikes are a few big parts (chassis, steering, forks, swingarm) cut into many loose pieces:
+        # there a click picks the whole big part; your own models start with single pieces
+        self.pick_mode = tk.StringVar(value='part' if self.import_family else 'piece')
         self.ingame = tk.BooleanVar(value=self.samples is not None or bool(self.glmesh_path))
         self.build()
         self.fill_parts(); self.fill_materials(); self.update_selection_ui()
         self.bind_keys()
         self.after(100, self.fit_view)
+        self.after(200, self.start_in_mode)
         self.protocol('WM_DELETE_WINDOW', self.close)
 
     # ================================================================ layout
     def build(self):
-        left = ttk.Frame(self, padding=8); left.pack(side='left', fill='y')
+        # ---- one window, three jobs: line the bike up, paint it, change its parts
+        import workshop
+        self.can_paint = workshop.is_import(self.blend)
+        mb = tk.Frame(self, background='#23262b'); mb.pack(side='top', fill='x')
+        st = ttk.Style(self)
+        st.configure('Mode.Toolbutton', font=('Segoe UI', 11, 'bold'), padding=(18, 6))
+        self.top_mode = tk.StringVar(value='lineup')
+        for val, txt in (('lineup', '①  Line up'), ('paint', '②  Paint'), ('parts', '③  Parts')):
+            b = ttk.Radiobutton(mb, text=txt, value=val, variable=self.top_mode, style='Mode.Toolbutton',
+                                command=lambda v=val: self.switch_mode(v))
+            b.pack(side='left', padx=(6 if val == 'lineup' else 2, 2), pady=4)
+            if val != 'lineup' and not self.can_paint: b.configure(state='disabled')
+        self.mode_note = tk.Label(mb, text='' if self.can_paint else 'Paint and Parts work on bikes imported from MX Bikes / '
+                                  'MX Simulator', background='#23262b', foreground='#9aa0a6', font=('Segoe UI', 9))
+        self.mode_note.pack(side='left', padx=12)
+        self.lu = ttk.Frame(self); self.lu.pack(fill='both', expand=True)
+        self.paint = None
+        left = ttk.Frame(self.lu, padding=8); left.pack(side='left', fill='y')
         ttk.Label(left, text='Game parts', font=('Segoe UI', 10, 'bold')).pack(anchor='w')
         ttk.Label(left, text='Shift/Ctrl+click to pick several', foreground='#666').pack(anchor='w')
         self.plist = ttk.Treeview(left, columns=('n',), show='tree headings', height=14, selectmode='extended')
         self.plist.heading('#0', text='Part', anchor='w'); self.plist.heading('n', text='pieces')
         self.plist.column('#0', width=245); self.plist.column('n', width=50, anchor='e')
+        self.plist.configure(height=10 if self.import_family else 14)
         self.plist.pack(fill='y', expand=True)
         self.plist.bind('<<TreeviewSelect>>', self.on_part_select)
+        pm = ttk.LabelFrame(left, text='Clicking in the view picks', padding=6); pm.pack(fill='x', pady=(8, 0))
+        r = ttk.Frame(pm); r.pack(fill='x')
+        ttk.Radiobutton(r, text='a big part', value='part', variable=self.pick_mode).pack(side='left')
+        ttk.Radiobutton(r, text='a loose piece', value='piece', variable=self.pick_mode).pack(side='left', padx=(10, 0))
+        if self.import_family:
+            bp = ttk.Frame(pm); bp.pack(fill='x', pady=(4, 0))
+            big = [u for u in BIG_PARTS if u in self.units]
+            for i, u in enumerate(big):
+                ttk.Button(bp, text=self.big_name(u), command=lambda u=u: self.pick_parts([u])).grid(
+                    row=i // 2, column=i % 2, sticky='ew', padx=1, pady=1)
+            bp.columnconfigure(0, weight=1); bp.columnconfigure(1, weight=1)
         box = ttk.LabelFrame(left, text='Selected pieces', padding=6); box.pack(fill='x', pady=(8, 0))
         self.pick_lbl = ttk.Label(box, text='', wraplength=270, justify='left'); self.pick_lbl.pack(anchor='w')
         r = ttk.Frame(box); r.pack(fill='x', pady=(4, 0))
@@ -112,7 +154,7 @@ class AlignEditor(tk.Toplevel):
         self.pick_box = ttk.Combobox(box, textvariable=self.pick_unit, state='disabled', values=self.units + [NONE], width=32)
         self.pick_box.pack(fill='x'); self.pick_box.bind('<<ComboboxSelected>>', self.reassign)
 
-        right = ttk.Frame(self, padding=8, width=300); right.pack(side='right', fill='y'); right.pack_propagate(False)
+        right = ttk.Frame(self.lu, padding=8, width=300); right.pack(side='right', fill='y'); right.pack_propagate(False)
         mt = ttk.Frame(right); mt.pack(fill='x')
         ttk.Radiobutton(mt, text='Align', value='align', variable=self.mode, command=self.on_mode).pack(side='left')
         ttk.Radiobutton(mt, text='Materials', value='materials', variable=self.mode, command=self.on_mode).pack(side='left', padx=10)
@@ -135,7 +177,7 @@ class AlignEditor(tk.Toplevel):
         ttk.Button(bot, text='Close', command=self.close).pack(side='left', padx=(4, 0))
         self.panel_align.pack(fill='both', expand=True, pady=(8, 0))
 
-        self.view_host = ttk.Frame(self); self.view_host.pack(side='left', fill='both', expand=True)
+        self.view_host = ttk.Frame(self.lu); self.view_host.pack(side='left', fill='both', expand=True)
         self.legend = tk.Label(self.view_host, text='', anchor='e', background='#2a2c30', foreground='#9aa0a6',
                                font=('Segoe UI', 9), padx=8)
         self.legend.pack(side='top', fill='x')
@@ -210,6 +252,14 @@ class AlignEditor(tk.Toplevel):
                           ttk.Button(f, text='Snap to original (position + size)', command=lambda: self.snap(True))]
         for b in self.snap_btns: b.pack(fill='x', pady=(4, 0))
         ttk.Button(f, text='Reset selection', command=self.reset).pack(fill='x', pady=(4, 0))
+        aa = ttk.LabelFrame(f, text='Auto align · line-up presets', padding=6); aa.pack(fill='x', pady=(8, 0))
+        r = ttk.Frame(aa); r.pack(fill='x')
+        ttk.Button(r, text='Auto align (axles, pegs, bars)', command=self.auto_align).pack(side='left', fill='x', expand=True)
+        self.undo_btn = ttk.Button(r, text='Undo', command=self.undo_auto, state='disabled', width=6)
+        self.undo_btn.pack(side='left', padx=(4, 0))
+        r = ttk.Frame(aa); r.pack(fill='x', pady=(4, 0))
+        ttk.Button(r, text='Save as preset…', command=self.save_preset).pack(side='left', fill='x', expand=True)
+        ttk.Button(r, text='Use a preset…', command=self.load_preset).pack(side='left', fill='x', expand=True, padx=(4, 0))
         return f
 
     def build_material_panel(self, parent):
@@ -256,7 +306,9 @@ class AlignEditor(tk.Toplevel):
                 self.plist.insert('', 'end', iid=u, text='□ %s  (game original)' % u, values=('-',), tags=('kept',))
             else:
                 tag = 'c_' + u; self.plist.tag_configure(tag, foreground='#%02x%02x%02x' % self.color[u])
-                self.plist.insert('', 'end', iid=u, text='■ ' + u + adj, values=(counts.get(u, 0),), tags=(tag,))
+                nm = BIG_NAMES.get(self.import_family, {}).get(u)
+                self.plist.insert('', 'end', iid=u, text='■ ' + u + ('  (%s)' % nm if nm else '') + adj,
+                                  values=(counts.get(u, 0),), tags=(tag,))
         if counts.get(None):
             self.plist.insert('', 'end', iid=NONE, text=NONE, values=(counts[None],))
         keep = [s for s in sel if self.plist.exists(s)] or [WHOLE]
@@ -341,6 +393,24 @@ class AlignEditor(tk.Toplevel):
             self.keep_chk.configure(state='normal' if one else 'disabled')
             self.keep_var.set(bool(one and self.unit(items[0]).get('keep_original')))
 
+    def big_name(self, u):
+        return BIG_NAMES.get(self.import_family, {}).get(u, u)
+
+    def pick_parts(self, units, add=False):
+        """Select whole game parts (moves / turns about the part's own pivot)."""
+        units = [u for u in units if u]
+        if not units: return
+        cur = [p for p in self.sel_parts if p not in (WHOLE, NONE)] if (add and not self.sel_pieces) else []
+        for u in units:
+            if u in cur and add: cur.remove(u)
+            elif u not in cur: cur.append(u)
+        self.sel_parts = cur or [WHOLE]
+        self.sel_pieces.clear()
+        self._suppress = True
+        try: self.plist.selection_set([p for p in self.sel_parts if self.plist.exists(p)])
+        finally: self._suppress = False
+        self.update_selection_ui(); self.render()
+
     def clear_pieces(self):
         self.sel_pieces.clear(); self.update_selection_ui(); self.render()
 
@@ -413,6 +483,7 @@ class AlignEditor(tk.Toplevel):
                 old = self.mapping['piece_adjust'].get(k) or [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
                 self.mapping['piece_adjust'][k] = automap.mat4_mul(D, old)
         else:
+            self._marks = None
             for k in items:
                 a = self.part_adj(k)
                 a['t'] = [a['t'][i] + t[i] for i in range(3)]
@@ -597,6 +668,10 @@ class AlignEditor(tk.Toplevel):
             return False
         return True
 
+    def feature_marks(self):
+        """[(game point, your point)] found by Auto align, shown until the next edit."""
+        return getattr(self, '_marks', None) or []
+
     def overlay_pivots(self):
         kind, items = self.targets()
         out = []
@@ -771,11 +846,11 @@ class AlignEditor(tk.Toplevel):
             poly = dr.polygon
             for pts, c in zip(xy, cl):
                 poly(pts, fill=c)
-        if self.ref_on_top.get():
+        if self.ref_on_top.get() or behind:         # on top - or faintly through your model (x-ray)
             arr = np.asarray(img).copy()
             for R, col, dm, sz in self.ghost_layers():
                 self.splat(arr, R, np.tile(np.array([int(c * dm) for c in col], np.uint8), (len(R), 1)), 1)
-            img = Image.fromarray(arr)
+            img = Image.fromarray(arr) if self.ref_on_top.get() else Image.blend(img, Image.fromarray(arr), 0.3)
         self._pick = None; self._idbuf = None
         self.show_image(img)
 
@@ -891,6 +966,12 @@ class AlignEditor(tk.Toplevel):
                   else [(a, b) for a, b, _ in self.project_py(pts)])
             for x, y in pr:
                 self.canvas.create_polygon(x, y - 4, x + 4, y, x, y + 4, x - 4, y, fill='#e8c547', outline='', tags='ov')
+        for gp, mp_ in self.feature_marks():
+            (gx, mx), (gy, my) = self.project_np(np.asarray([gp, mp_], np.float64))[:2]
+            self.canvas.create_line(gx, gy, mx, my, fill='#ff4fd8', width=1, tags='ov')
+            self.canvas.create_oval(mx - 4, my - 4, mx + 4, my + 4, outline='#ff4fd8', width=2, tags='ov')
+            self.canvas.create_line(gx - 8, gy, gx + 8, gy, fill='#4cff7a', width=2, tags='ov')
+            self.canvas.create_line(gx, gy - 8, gx, gy + 8, fill='#4cff7a', width=2, tags='ov')
         kind, items = self.targets()
         if kind == 'parts' and self.mode.get() == 'align':
             for k in items[:6]:
@@ -993,6 +1074,8 @@ class AlignEditor(tk.Toplevel):
                     hit = int(pid[m][int(np.argmin(d))])
                 else:
                     hit = min(((px - x) ** 2 + (py - y) ** 2, pid) for px, py, pid in self._pick if pid in ids)[1]
+        if self.pick_mode.get() == 'part' and hit is not None and self.pieces[hit]['unit']:
+            self.pick_parts([self.pieces[hit]['unit']], add); return
         if hit is None:
             if not add: self.sel_pieces.clear()
         elif add:
@@ -1002,7 +1085,10 @@ class AlignEditor(tk.Toplevel):
         self.update_selection_ui(); self.render()
 
     def box_select(self, x0, y0, x1, y1):
-        self.sel_pieces |= self.ids_in(int(x0), int(y0), int(x1), int(y1))
+        ids = self.ids_in(int(x0), int(y0), int(x1), int(y1))
+        if self.pick_mode.get() == 'part':
+            self.pick_parts(sorted({self.pieces[i]['unit'] for i in ids if self.pieces[i]['unit']}), True); return
+        self.sel_pieces |= ids
         self.update_selection_ui(); self.render()
 
     def on_pan_down(self, e):
@@ -1036,18 +1122,172 @@ class AlignEditor(tk.Toplevel):
                 r[ax] = sign * deg * (10 if e.state & 0x1 else 1) * (1 if fwd[ax] > 0 else -1)
                 self.apply_delta(r=r)
             return f
+        def lu(f):                                   # these keys belong to the Line up tab
+            def g(e):
+                if self.top_mode.get() != 'lineup': return
+                return f(e)
+            return g
         for key, args in (('<Left>', (-1, 0, 0)), ('<Right>', (1, 0, 0)), ('<Up>', (0, 1, 0)), ('<Down>', (0, -1, 0)),
                           ('<Prior>', (0, 0, 1)), ('<Next>', (0, 0, -1))):
-            self.bind(key, move(*args)); self.bind('<Shift-%s' % key[1:], move(*args))
-        self.bind('<bracketleft>', turn(-1)); self.bind('<bracketright>', turn(1))
-        self.bind('<plus>', lambda e: self.nudge('s', 0, 1)); self.bind('<equal>', lambda e: self.nudge('s', 0, 1))
-        self.bind('<minus>', lambda e: self.nudge('s', 0, -1))
-        self.bind('<Escape>', lambda e: self.clear_pieces())
-        self.bind('1', lambda e: self.set_view(-90, 0)); self.bind('2', lambda e: self.set_view(0, 0))
-        self.bind('3', lambda e: self.set_view(-90, 89.9)); self.bind('4', lambda e: self.set_view(180, 0))
+            self.bind(key, lu(move(*args)), add='+'); self.bind('<Shift-%s' % key[1:], lu(move(*args)), add='+')
+        self.bind('<bracketleft>', lu(turn(-1)), add='+'); self.bind('<bracketright>', lu(turn(1)), add='+')
+        self.bind('<plus>', lu(lambda e: self.nudge('s', 0, 1)), add='+')
+        self.bind('<equal>', lu(lambda e: self.nudge('s', 0, 1)), add='+')
+        self.bind('<minus>', lu(lambda e: self.nudge('s', 0, -1)), add='+')
+        self.bind('<Escape>', lu(lambda e: self.clear_pieces()), add='+')
+        self.bind('1', lu(lambda e: self.set_view(-90, 0)), add='+'); self.bind('2', lu(lambda e: self.set_view(0, 0)), add='+')
+        self.bind('3', lu(lambda e: self.set_view(-90, 89.9)), add='+'); self.bind('4', lu(lambda e: self.set_view(180, 0)), add='+')
+
+    # ================================================================ auto align
+    def auto_align(self):
+        import copy
+        import autoalign
+        if np is None:
+            messagebox.showerror('Auto align', 'Auto align needs numpy (pip install numpy).', parent=self); return
+        before = copy.deepcopy(self.mapping['adjust'])
+        try:
+            self.mapping['adjust'] = {}                  # features are found on your model as matched, unadjusted
+            by, shapes, wheel_units = {}, [], set()
+            ext = None
+            for i, p in enumerate(self.pieces):
+                P = self.verts(p)
+                if not len(P): continue
+                by.setdefault(p['unit'], []).append(P)
+                lo, hi = P.min(0), P.max(0)
+                ext = (lo, hi) if ext is None else (np.minimum(ext[0], lo), np.maximum(ext[1], hi))
+            by = {u: np.concatenate(v) for u, v in by.items()}
+            length = float(ext[1][2] - ext[0][2]) if ext is not None else 2.0
+            for i, p in enumerate(self.pieces):
+                if p['n'] < 30: continue
+                sh = automap._shape(self.verts(p))
+                if automap._is_wheel(sh) and sh['radius'] > 0.11 * length: shapes.append((i, sh))
+            for u in ('front_tire', 'back_tire'):
+                if u in by and not self.unit(u).get('keep_original'): wheel_units.add(u)
+            m, notes = autoalign.model_features(by, shapes)
+            g = autoalign.game_features(self.parts, self.helpers)
+            units = [u for u in self.units if not self.unit(u).get('keep_original')]
+            adj, rep, marks = autoalign.solve(m, g, units, wheel_units)
+        except Exception as e:
+            self.mapping['adjust'] = before
+            messagebox.showerror('Auto align', 'Could not auto align:\n%s' % e, parent=self); return
+        self.mapping['adjust'] = adj
+        self._undo_adjust = before; self.undo_btn.configure(state='normal')
+        self._marks = [(gp, mp_) for mp_, gp, _ in marks]
+        self.dirty = True; self._idbuf = None
+        self.fill_parts(); self.update_selection_ui(); self.render()
+        self.app.write_log('  Auto align: ' + '; '.join(r.strip() for r in notes + rep), 'dim')
+        messagebox.showinfo('Auto align', '\n'.join(notes + [''] + rep + [
+            '', 'Green crosses = the game bike\'s axles, pegs and grips; pink = yours. Fine-tune with the boxes '
+                'if needed, then Save (and "Save as preset" to reuse it for other bikes).']), parent=self)
+
+    def undo_auto(self):
+        if getattr(self, '_undo_adjust', None) is None: return
+        self.mapping['adjust'] = self._undo_adjust; self._undo_adjust = None; self._marks = None
+        self.undo_btn.configure(state='disabled')
+        self.dirty = True; self._idbuf = None; self.fill_parts(); self.update_selection_ui(); self.render()
+
+    # ================================================================ the three tabs
+    def switch_mode(self, mode):
+        cur = getattr(self, '_mode_now', 'lineup')
+        if mode == cur: return
+        if mode in ('paint', 'parts'):
+            if self.paint is None:
+                import workshop
+                try:
+                    self.paint = workshop.PaintPanel(self, self, self.app, self.blend, mode)
+                except Exception as e:
+                    messagebox.showerror('Paint', 'Could not open the bike for painting:\n%s' % e, parent=self)
+                    self.top_mode.set(cur); return
+            self.lu.pack_forget()
+            self.paint.pack(fill='both', expand=True); self.paint.set_page(mode); self.paint.active = True
+            self._mode_now = mode
+            return
+        # back to Line up: bring the paint / parts into the model first
+        if self.paint is not None and self.paint.dirty:
+            a = messagebox.askyesnocancel('Line up', 'Put your paint and parts changes on the model now? The Line up '
+                                          'view is refreshed with them (takes a little while).\n\nNo = line up '
+                                          'without them for now (they stay saved for later).', parent=self)
+            if a is None:
+                self.top_mode.set(cur); return
+            if a:
+                self.paint.build_bike(done=lambda ok: self.reload('lineup') if ok else self.top_mode.set(cur))
+                return
+        if getattr(self, '_need_reload', False):
+            self.reload('lineup'); return
+        self.paint.active = False; self.paint.pack_forget()
+        self.lu.pack(fill='both', expand=True); self._mode_now = 'lineup'
+        self.render()
+
+    def after_apply(self):
+        """Paint / parts were put on the model: the Line up tab reloads when you go back to it."""
+        self._need_reload = True
+
+    def reload(self, mode):
+        """Open the editor again on the rebuilt model (your line-up edits are saved first)."""
+        if self.dirty: self.save(quiet=True)
+        if self.paint is not None: self.paint.save_now()
+        self.dirty = False
+        try:
+            self.app.align(start_mode=mode)
+        except TypeError:
+            self.app.align()
+        self.destroy()
+
+    def start_in_mode(self):
+        if self.start_mode in ('paint', 'parts') and self.can_paint:
+            self.top_mode.set(self.start_mode); self.switch_mode(self.start_mode)
+
+    # ================================================================ presets
+    def family(self):
+        try:
+            with open(self.blend + '.import.json') as fh: return json.load(fh).get('family') or ''
+        except (OSError, ValueError):
+            return ''
+
+    def save_preset(self):
+        from tkinter import simpledialog
+        import lineup_presets
+        fam = self.family()
+        default = '%s → %s' % (fam or os.path.splitext(os.path.basename(self.blend))[0], self.model)
+        name = simpledialog.askstring('Save line-up preset', 'Name for this line-up:\n(models imported from %s pick '
+                                      'it automatically)' % fam if fam else 'Name for this line-up:',
+                                      initialvalue=default, parent=self)
+        if not name: return
+        if lineup_presets.find(name) and not messagebox.askyesno('Save line-up preset', 'Replace the preset "%s"?'
+                                                                % name, parent=self): return
+        lineup_presets.save(name, self.mapping, fam)
+        self.app.write_log('  ✔ line-up preset "%s" saved' % name, 'ok')
+        try: self.app.fill_presets()
+        except Exception: pass
+        messagebox.showinfo('Save line-up preset', 'Saved "%s".\n\nPick it under "Line-up preset" in the main window '
+                            'for other models (bikes you import from %s get it automatically). This model\'s own '
+                            'edits still need Save.' % (name, fam or 'the same game'), parent=self)
+
+    def load_preset(self):
+        import lineup_presets
+        ps = lineup_presets.list_presets()
+        if not ps:
+            messagebox.showinfo('Use a preset', 'No presets saved yet - line a model up, then "Save as preset…".',
+                                parent=self); return
+        name = self.app.choose('Use a preset', 'Use which line-up? (replaces the part moves in this window)',
+                               [p['name'] for p in ps])
+        if not name: return
+        import copy
+        pr = lineup_presets.load(next(p['path'] for p in ps if p['name'] == name))
+        self._undo_adjust = copy.deepcopy(self.mapping['adjust']); self.undo_btn.configure(state='normal')
+        what = lineup_presets.apply(self.mapping, pr, with_fit=False)
+        self._marks = None
+        self.dirty = True; self._idbuf = None; self.fill_parts(); self.update_selection_ui(); self.render()
+        fit_note = ''
+        f0, f1 = self.mapping.get('fit') or {}, pr.get('fit') or {}
+        if f0.get('m') != f1.get('m') or f0.get('offset') != f1.get('offset'):
+            fit_note = ('\n\nThe preset was made on a model that was sized/placed a little differently. For an exact '
+                        'match choose it under "Line-up preset" in the main window and use "Re-match" (or Auto align '
+                        'here).')
+        messagebox.showinfo('Use a preset', 'Used "%s" (%s).%s' % (name, what, fit_note), parent=self)
 
     # ================================================================ save
-    def save(self):
+    def save(self, quiet=False):
         for k in [k for k, a in self.mapping['adjust'].items() if automap.is_identity(a)]: self.mapping['adjust'].pop(k)
         I = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
         for k in [k for k, M in self.mapping['piece_adjust'].items()
@@ -1058,9 +1298,15 @@ class AlignEditor(tk.Toplevel):
         self.dirty = False
         self.app.write_log('  ✔ edits saved for %s - Export will use them' % os.path.basename(self.blend), 'ok')
         self.app.on_inputs()
-        messagebox.showinfo('Edit model', 'Saved. Click Export in the main window to write the game file.', parent=self)
+        if not quiet:
+            messagebox.showinfo('Edit model', 'Saved. Click Export in the main window to write the game file.', parent=self)
 
     def close(self):
-        if self.dirty and messagebox.askyesno('Edit model', 'Save your changes before closing?', parent=self):
+        if self.dirty and messagebox.askyesno('Edit model', 'Save your line-up changes before closing?', parent=self):
             self.save()
+        if self.paint is not None:
+            self.paint.save_now()
+            if self.paint.dirty and messagebox.askyesno('Edit model', 'Put your paint and parts changes on the model '
+                                                        'now? (They stay saved either way.)', parent=self):
+                self.paint.build_bike(done=lambda ok: self.destroy()); return
         self.destroy()

@@ -1,0 +1,14 @@
+GameModelExporter bundles no third-party code. It uses these separately installed,
+open-source programs and libraries (installed by you, e.g. with pip):
+
+  Python 3 / Tkinter      PSF License                https://www.python.org
+  NumPy                   BSD 3-Clause               https://numpy.org
+  Pillow                  MIT-CMU (HPND)             https://python-pillow.org
+  PyOpenGL                BSD-style                  https://pyopengl.sourceforge.net
+  pyopengltk              MIT                        https://github.com/jonwright/pyopengltk
+  tkinterdnd2             MIT                        https://github.com/Eliav2/tkinterdnd2
+  Blender (bpy)           GPL-2.0-or-later           https://www.blender.org
+
+gamemodel_blender.py / the Blender add-on runs inside Blender. The MIT licence is
+GPL-compatible, so the add-on can be shared under MIT; when combined with Blender
+the whole is covered by Blender's GPL.

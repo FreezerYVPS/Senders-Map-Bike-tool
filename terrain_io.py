@@ -320,6 +320,8 @@ class Placement:
         # optional per-pixel tree height (canopy) / boulder maps 0..255, -1 = leave the game's (after clearing)
         self.canopy = None
         self.rocks = None
+        # optional per-pixel second surface mixed in: layer * 256 + amount 1..255 (-1 = none)
+        self.smix = None
 
     def sample_map(self, A, X, Z):
         lx, lz = self.local(X, Z)
@@ -496,6 +498,12 @@ def apply_placement(t, pl, log=print):
         f0[cov] = mi[cov]; s0[cov] = sec[cov]; b0[cov] = bl[cov]
         if surf_map is not None:
             mixed_cells(pl, X, Z, g, w, old, f0, s0, b0)
+        sm = getattr(pl, 'smix', None)
+        if sm is not None:                               # a second surface mixed in by a set amount (a tint)
+            v = pl.sample_map(sm, X, Z).astype(np.int64)
+            lay = v >> 8; amt = v & 255
+            ok = (v >= 0) & (w > 0.5) & (lay != f0) & (lay < len(MATERIALS))
+            s0[ok] = lay[ok]; b0[ok] = amt[ok].astype(np.uint8)
     if pl.clear_biomes:
         for m in t['biome_height']:
             A = m['map'].reshape(g.ry, g.rx); sub = A[iz0:iz1, ix0:ix1].astype(np.float32)
@@ -521,6 +529,17 @@ def apply_placement(t, pl, log=print):
     log('INFO track placed: %.0f x %.0f m, heights %.1f..%.1f m, detail %dx%d (%.3f m)' %
         (pl.width, pl.length, lo, hi, nx, nz, res))
     return t
+
+
+def replace_layer(t, src, dst):
+    """Every cell of the map showing layer `src` shows `dst` instead (keeping first != second)."""
+    mw = t['material_weights']
+    F, S, B = mw['first'], mw['second'], mw['blend']
+    n = int((F == src).sum() + (S == src).sum())
+    F[F == src] = dst; S[S == src] = dst
+    same = F == S
+    S[same] = (F[same] + 1) % len(MATERIALS); B[same] = 0
+    return n
 
 
 def flatten_map(t, keep=(0, 1), level=None, blend=40.0, clear=False, log=print):

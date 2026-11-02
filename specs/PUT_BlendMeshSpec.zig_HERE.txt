@@ -1,0 +1,1 @@
+Put the game's BlendMeshSpec.zig here (or add it on the Spec tab). It is the game developer's file and isn't included.

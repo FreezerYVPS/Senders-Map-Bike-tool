@@ -255,6 +255,8 @@ class Studio(tk.Toplevel):
         self.sel = None                     # ('track', i) / ('point', i, j) / ('jump', k) / ('rut', k) / ('bump', k)
         self.sel_pts = set()
         self._drag = None; self._eval_job = None; self._gl_job = None; self._busy = False; self._mask_dirty = False
+        self._render_job = None; self._drawn = None; self._shifted = (0.0, 0.0); self._gl_win = None
+        self.view_rot = 0.0                 # the 2D view's turn (radians): up on screen = the 3D camera's facing
         self.ref_img = None
         self.geometry('1500x900'); self.minsize(1100, 700)
         self._root().report_callback_exception = self._report_error
@@ -304,7 +306,10 @@ class Studio(tk.Toplevel):
         self.nb = ttk.Notebook(right); self.nb.pack(fill='both', expand=True)
         self.panels = {}
         for t in TABS:
-            fr = ttk.Frame(self.nb, padding=(6, 6)); self.nb.add(fr, text=t); self.panels[t] = fr
+            self.panels[t] = self.make_panel(t)
+        self.bind_all('<MouseWheel>', self.panel_wheel, add='+')
+        self.bind_all('<Button-4>', lambda e: self.panel_wheel(e, -1), add='+')
+        self.bind_all('<Button-5>', lambda e: self.panel_wheel(e, 1), add='+')
         self.nb.bind('<<NotebookTabChanged>>', lambda e: (self.render(), self.update_cursor_hint(), self.reload_brush_panels()))
         self.build_terrain(self.panels['Terrain']); self.build_track(self.panels['Track'])
         self.build_jumps(self.panels['Jumps']); self.build_ruts(self.panels['Ruts'])
@@ -319,6 +324,11 @@ class Studio(tk.Toplevel):
         c.bind('<ButtonPress-3>', self.on_right); c.bind('<B3-Motion>', self.on_pan); c.bind('<ButtonRelease-3>', self.on_pan_end)
         c.bind('<ButtonPress-2>', self.on_pan_start); c.bind('<B2-Motion>', self.on_pan); c.bind('<ButtonRelease-2>', self.on_pan_end)
         c.bind('<Motion>', self.on_motion); c.bind('<Leave>', lambda e: c.delete('brush'))
+        c.bind('<Control-ButtonPress-3>', self.on_turn_start); c.bind('<Control-B3-Motion>', self.on_turn)
+        c.bind('<Control-ButtonRelease-3>', lambda e: setattr(self, '_turn', None))
+        for k, d in (('q', -15), ('e', 15)):
+            self.bind('<Key-%s>' % k, lambda ev, d=d: None if isinstance(self.focus_get(), (tk.Entry, ttk.Entry, ttk.Spinbox,
+                                                                                            ttk.Combobox)) else self.turn_view(d), add='+')
         c.bind('<MouseWheel>', lambda e: self.wheel(e, e.delta > 0))
         c.bind('<Button-4>', lambda e: self.wheel(e, True)); c.bind('<Button-5>', lambda e: self.wheel(e, False))
         self.bind('<Control-z>', lambda e: self.undo()); self.bind('<Control-y>', lambda e: self.redo())
@@ -329,6 +339,8 @@ class Studio(tk.Toplevel):
         try:
             import hm_gl
             self.gl = hm_gl.TerrainGL(self.views, width=400, height=400)
+            self.gl.owner = self
+            self.gl.yaw = -math.pi / 2                     # facing north, like the 2D map (up = north)
             self.gl.bind('<Shift-Button-1>', self.gl_click)
             self.after(2500, self.check_gl)
         except Exception as e:                               # no OpenGL: 2D only
@@ -341,6 +353,66 @@ class Studio(tk.Toplevel):
             pt = self.gl.ground_at(e.x, e.y)
             if pt is not None: self.place_jump(*pt)
             return 'break'
+
+    # ---- editing directly in the 3D view: the same tools as on the map, at the spot under the mouse
+    EDIT3D = ('Track', 'Jumps', 'Ruts', 'Sculpt', 'Surface', 'Nature')
+
+    def edit3d(self):
+        return self.tab() in self.EDIT3D and self.H is not None
+
+    def gl_edit(self, what, pt, e):
+        """A mouse press / drag / release on the 3D terrain at area-local point pt: handled like the same action on
+        the 2D map (the map turns the point into its own screen position)."""
+        import types
+        if pt is None:
+            if what == 'up' and self._drag is not None:
+                d = getattr(self, '_last3d', None)
+                if d is not None: pt = d
+            if pt is None: return
+        self._last3d = pt
+        cx, cy = self.w2c(*pt)
+        ev = types.SimpleNamespace(x=cx, y=cy, state=e.state, x_root=e.x_root, y_root=e.y_root, widget=self.canvas)
+        if what == 'down': self.on_down(ev)
+        elif what == 'drag': self.on_drag(ev)
+        else: self.on_up(ev)
+        if self.gl is not None: self.gl.request()
+
+    def gl_hover(self, pt, e):
+        if pt is not None and self.H is not None:
+            x, z = pt
+            self.cursor_lbl.config(text='x %.1f  z %.1f m   height %.2f m   (3D)' % (
+                x, z, float(self.H[min(self.p.n - 1, int(round(z / self.p.px))), min(self.p.n - 1, int(round(x / self.p.px)))])))
+
+    def overlay3d(self, cursor):
+        """What the 3D view draws on the terrain: tracks, their points, jumps, ruts and the brush ring."""
+        t = self.tab()
+        lines, points = [], []
+        for i, tr in enumerate(self.p.tracks):
+            cur = self.curve_of(i)
+            active = i == self.cur_track_index()
+            if cur is not None and len(cur[0]) > 1:
+                Cc = cur[0][::max(1, int(len(cur[0]) / 1500))]
+                lines.append((Cc, (1.0, 0.82, 0.29, 0.95) if active else (0.79, 0.65, 0.25, 0.6), 2.5 if active else 1.5))
+            if t == 'Track' or (active and t == 'Jumps'):
+                for j, q in enumerate(tr['points']):
+                    on = self.sel is not None and self.sel[0] == 'point' and self.sel[1] == i and self.sel[2] == j
+                    points.append(((float(q[0]), float(q[1])), (1.0, 0.31, 0.19, 1) if on else (1, 1, 1, 0.95), 9 if on else 7))
+        for jp in getattr(self.p, 'jumps', []):
+            try:
+                poly = self.jump_poly(jp)
+                if poly is not None and len(poly) > 2:
+                    P = np.asarray(poly, np.float64).reshape(-1, 2); P = np.vstack([P, P[:1]])
+                    lines.append((P, (0.35, 0.85, 1.0, 0.9), 1.5))
+            except Exception:
+                pass
+        for r in getattr(self.p, 'ruts', []):
+            pts = r.get('points') or []
+            if len(pts) > 1: lines.append((np.asarray(pts, np.float64), (0.9, 0.55, 1.0, 0.8), 1.5))
+        if cursor is not None and t in ('Sculpt', 'Surface', 'Nature'):
+            rad = self.brush['radius'] if t == 'Sculpt' else self.paint_radius()
+            a = np.linspace(0, 2 * np.pi, 64)
+            lines.append((np.column_stack([cursor[0] + rad * np.cos(a), cursor[1] + rad * np.sin(a)]), (1, 1, 1, 0.95), 2))
+        return {'lines': lines, 'points': points}
 
     def layout_views(self):
         m = self.viewmode.get()
@@ -372,6 +444,50 @@ class Studio(tk.Toplevel):
         self.gl.slope = self.slope.get(); self.gl.grid = self.grid3d.get(); self.gl.request()
 
     # ------------------------------------------------------------------ panels
+    def make_panel(self, text, index='end'):
+        """A notebook tab whose contents scroll when the window is too short to show them all."""
+        outer = ttk.Frame(self.nb)
+        cv = tk.Canvas(outer, highlightthickness=0, borderwidth=0, yscrollincrement=20)
+        try: cv.configure(background=ttk.Style(self).lookup('TFrame', 'background') or cv.cget('background'))
+        except tk.TclError: pass
+        sb = ttk.Scrollbar(outer, orient='vertical', command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        inner = ttk.Frame(cv, padding=(6, 6))
+        win = cv.create_window(0, 0, window=inner, anchor='nw')
+
+        def sync(_e=None):
+            cv.configure(scrollregion=(0, 0, inner.winfo_reqwidth(), inner.winfo_reqheight()))
+            if inner.winfo_reqheight() > cv.winfo_height() > 1:
+                if not sb.winfo_ismapped(): sb.pack(side='right', fill='y', before=cv)
+            elif sb.winfo_ismapped():
+                sb.pack_forget(); cv.yview_moveto(0)
+        inner.bind('<Configure>', sync)
+        cv.bind('<Configure>', lambda e: (cv.itemconfigure(win, width=e.width), sync()))
+        cv.pack(side='left', fill='both', expand=True)
+        outer._scroll_canvas = cv; outer._inner = inner
+        if index == 'end': self.nb.add(outer, text=text)
+        else: self.nb.insert(index, outer, text=text)
+        self._scroll_panels = getattr(self, '_scroll_panels', []) + [(outer, cv, inner)]
+        return inner
+
+    def panel_wheel(self, e, step=None):
+        """The mouse wheel over a tab's controls scrolls the tab (lists, combo boxes and the map keep theirs)."""
+        try:
+            w = self.winfo_containing(e.x_root, e.y_root)
+        except (tk.TclError, KeyError):
+            return
+        if w is None or isinstance(w, (tk.Listbox, tk.Text, ttk.Treeview, ttk.Combobox, ttk.Spinbox, tk.Spinbox)):
+            return
+        for outer, cv, inner in getattr(self, '_scroll_panels', []):
+            x = w
+            while x is not None and x is not outer:
+                x = getattr(x, 'master', None)
+            if x is None: continue
+            if inner.winfo_reqheight() <= cv.winfo_height(): return
+            if step is None: step = -1 if e.delta > 0 else 1
+            cv.yview_scroll(step * 3, 'units')
+            return
+
     def section(self, parent, text):
         ttk.Label(parent, text=text, font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(8, 2))
 
@@ -498,7 +614,7 @@ class Studio(tk.Toplevel):
         lbl = ttk.Label(d, text='', foreground='#555'); lbl.grid(row=2, column=0, columnspan=2, padx=8)
 
         def upd(*a):
-            try: lbl.config(text='= %.0f x %.0f m' % ((int(n.get()) - 1) * float(px.get()),) * 2)
+            try: lbl.config(text='= %.0f x %.0f m' % (((int(n.get()) - 1) * float(px.get()),) * 2))
             except ValueError: pass
         n.trace_add('write', upd); px.trace_add('write', upd); upd()
 
@@ -1069,6 +1185,18 @@ class Studio(tk.Toplevel):
         g = ttk.Frame(f); g.pack(fill='x')
         for i, name in enumerate(SURF_CHOICES + ['Automatic (erase painting)', "Keep the game's ground"]):
             ttk.Radiobutton(g, text=name, value=name, variable=self.paint_layer).grid(row=i // 2, column=i % 2, sticky='w', padx=(0, 10))
+        r = ttk.Frame(f); r.pack(fill='x', pady=(6, 0))
+        ttk.Label(r, text='Mix in').pack(side='left')
+        self.mix_layer = tk.StringVar(value='(nothing)')
+        ttk.Combobox(r, textvariable=self.mix_layer, values=['(nothing)'] + SURF_CHOICES, state='readonly',
+                     width=18).pack(side='left', padx=4)
+        ttk.Label(r, text='at').pack(side='left')
+        self.mix_amt = tk.IntVar(value=20)
+        ttk.Spinbox(r, from_=1, to=100, increment=5, textvariable=self.mix_amt, width=4).pack(side='left', padx=3)
+        ttk.Label(r, text='%').pack(side='left')
+        self.hint(f, 'Mix in: every spot you paint gets the layer above blended with this one (the game blends two '
+                     'surfaces per 0.5 m cell) - a tint just there, e.g. Light dirt with 20% Grass on one track, '
+                     'Track dirt 1 with 30% Track dirt 2 on another.')
         self.section(f, 'Brush')
         self.surf_panel = BrushPanel(f, self.pbrush, self.render).pack(fill='x')
         self.hint(f, 'Pick a tip, then drag on the map. Lower opacity / density paints sparse cover: e.g. Grass with '
@@ -1279,22 +1407,31 @@ class Studio(tk.Toplevel):
 
     def reshade(self, win=None):
         if self.H is None: return
-        if win is None:
-            full = (slice(0, self.p.n), slice(0, self.p.n))
-            self.rgb = C.shade(self.H, self.p.px, surface=self.shade_surface(full), palette=self.palette())
+        n = self.p.n
+        if win is None or getattr(self, '_hrange', None) is None:
+            full = (slice(0, n), slice(0, n))
+            self._hrange = tuple(np.percentile(self.H, [1, 99])) if self.H.size else (0, 1)
+            self.rgb = C.shade(self.H, self.p.px, surface=self.shade_surface(full), palette=self.palette(),
+                               hrange=self._hrange)
             self.draw_nature(self.rgb, full)
             if self.show_mask_on(): self._tint_mask(self.rgb, self.p.mask)
             self.pil = Image.fromarray(self.rgb)
+            win = None
         else:
-            r0, r1 = max(0, win[0].start - 1), min(self.p.n, win[0].stop + 1)
-            c0, c1 = max(0, win[1].start - 1), min(self.p.n, win[1].stop + 1)
-            sub = C.shade(self.H[r0:r1, c0:c1], self.p.px, surface=self.shade_surface((slice(r0, r1), slice(c0, c1))),
-                          palette=self.palette())
+            r0, r1 = max(0, win[0].start - 1), min(n, win[0].stop + 1)          # slopes change 1 pixel around
+            c0, c1 = max(0, win[1].start - 1), min(n, win[1].stop + 1)
+            q0, q1, k0, k1 = max(0, r0 - 1), min(n, r1 + 1), max(0, c0 - 1), min(n, c1 + 1)   # + their neighbours
+            sub = C.shade(self.H[q0:q1, k0:k1], self.p.px, surface=self.shade_surface((slice(q0, q1), slice(k0, k1))),
+                          palette=self.palette(), hrange=self._hrange)[r0 - q0:r1 - q0, c0 - k0:c1 - k0]
+            sub = np.ascontiguousarray(sub)
             self.draw_nature(sub, (slice(r0, r1), slice(c0, c1)))
             if self.show_mask_on(): self._tint_mask(sub, self.p.mask[r0:r1, c0:c1])
             self.rgb[r0:r1, c0:c1] = sub
             self.pil.paste(Image.fromarray(sub), (c0, r0))
-        self.render(); self.push_gl(win is not None)
+            if self.patch_render((slice(r0, r1), slice(c0, c1))):
+                self.push_gl(True, (slice(r0, r1), slice(c0, c1))); return
+            win = (slice(r0, r1), slice(c0, c1))
+        self.render(); self.push_gl(win is not None, win)
 
     def shade_surface(self, win):
         return self.info['surface'][win]
@@ -1308,6 +1445,11 @@ class Studio(tk.Toplevel):
         return np.where(c >= 0, c, 0), np.where(r >= 0, r, 0)
 
     def draw_nature(self, rgb, win):
+        sm = self.p.smix[win]
+        if (sm >= 0).any():
+            pal = self.palette()
+            C.mix_rgb(rgb, sm, (lambda k: C.SURF_RGB[C.SURFACES[k]]) if pal is None else
+                      (lambda k: tuple(pal[k])))
         if not (getattr(self, 'show_nature', None) is not None and self.show_nature.get()): return
         can, rk = self.nature_maps(win)
         surf = self.shade_surface(win)
@@ -1323,11 +1465,19 @@ class Studio(tk.Toplevel):
         k = (np.clip(m, 0, 1) * 0.45)[..., None]
         if k.max() > 0: rgb[:] = (rgb * (1 - k) + np.array([220, 40, 40]) * k).astype(np.uint8)
 
-    def push_gl(self, throttle=False):
+    def push_gl(self, throttle=False, win=None):
+        """Send the heights / colours to the 3D view - only the changed window when there is one."""
         if self.gl is None or self.H is None or self.viewmode.get() == '2d': return
+        if win is not None:
+            g = self._gl_win
+            self._gl_win = win if g is None else (slice(min(g[0].start, win[0].start), max(g[0].stop, win[0].stop)),
+                                                  slice(min(g[1].start, win[1].start), max(g[1].stop, win[1].stop)))
         if throttle:
             if self._gl_job: return
-            self._gl_job = self.after(120, lambda: (setattr(self, '_gl_job', None), self.push_gl()))
+            self._gl_job = self.after(60, lambda: (setattr(self, '_gl_job', None), self.push_gl(False)))
+            return
+        w, self._gl_win = self._gl_win, None
+        if w is not None and hasattr(self.gl, 'update_window') and self.gl.update_window(self.H, self.rgb, self.p.size, w):
             return
         self.gl.set_data(self.H, self.rgb, self.p.size); self.gl_settings()
 
@@ -1335,13 +1485,68 @@ class Studio(tk.Toplevel):
         W = max(200, self.canvas.winfo_width()); Hh = max(200, self.canvas.winfo_height())
         self.vx = self.vz = self.p.size / 2; self.mpp = self.p.size / min(W, Hh) * 1.04; self.render()
 
-    def w2c(self, x, z):
+    # ---- view space (vx / vz) <-> screen, with the view turned by view_rot
+    def vs2c(self, x, z):
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
-        return (x - self.vx) / self.mpp + W / 2, H / 2 - (z - self.vz) / self.mpp      # z up the screen
+        c, s_ = math.cos(self.view_rot), math.sin(self.view_rot)
+        dx, dz = x - self.vx, z - self.vz
+        return W / 2 + (dx * c - dz * s_) / self.mpp, H / 2 - (dx * s_ + dz * c) / self.mpp
+
+    def c2vs(self, cx, cy):
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        c, s_ = math.cos(self.view_rot), math.sin(self.view_rot)
+        a, b = (cx - W / 2) * self.mpp, -(cy - H / 2) * self.mpp
+        return self.vx + a * c + b * s_, self.vz - a * s_ + b * c
+
+    def vs_origin(self):
+        """Where area-local (0, 0) is in view space (the map editor puts areas on the world)."""
+        return 0.0, 0.0
+
+    def w2c(self, x, z):
+        ox, oz = self.vs_origin(); return self.vs2c(x + ox, z + oz)
 
     def c2w(self, cx, cy):
+        ox, oz = self.vs_origin(); x, z = self.c2vs(cx, cy); return x - ox, z - oz
+
+    def affine(self, box, sx, sy, ox=0.0, oz=0.0):
+        """PIL AFFINE data: a pixel of the screen box -> ((x - ox) * sx, (z - oz) * sy) of view-space point x, z."""
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
-        return (cx - W / 2) * self.mpp + self.vx, self.vz - (cy - H / 2) * self.mpp
+        c, s_ = math.cos(self.view_rot), math.sin(self.view_rot); m = self.mpp
+        bx0, by0 = box[0] + 0.5, box[1] + 0.5
+        X0 = self.vx + (bx0 - W / 2) * m * c - (by0 - H / 2) * m * s_
+        Z0 = self.vz - (bx0 - W / 2) * m * s_ - (by0 - H / 2) * m * c
+        return ((m * c) * sx, (-m * s_) * sx, (X0 - ox) * sx, (-m * s_) * sy, (-m * c) * sy, (Z0 - oz) * sy)
+
+    def poly_of(self, x0, z0, x1, z1):
+        """Screen corners of a view-space rectangle (for outlines that turn with the view)."""
+        return [v for p in ((x0, z0), (x1, z0), (x1, z1), (x0, z1)) for v in self.vs2c(*p)]
+
+    # ---- turning the 2D view; the 3D view turns with it (and the other way round)
+    def set_rot(self, rot, from3d=False):
+        self.view_rot = (rot + math.pi) % (2 * math.pi) - math.pi
+        if not from3d and self.gl is not None:
+            self.gl.yaw = math.atan2(-math.cos(self.view_rot), -math.sin(self.view_rot)); self.gl.request()
+        self.request_render()
+
+    def gl_turned(self, yaw):
+        self.set_rot(math.atan2(-math.cos(yaw), -math.sin(yaw)), from3d=True)
+
+    def turn_view(self, deg):
+        self.set_rot(self.view_rot + math.radians(deg))
+
+    def north_up(self):
+        self.set_rot(0.0)
+
+    def on_turn_start(self, e):
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        self._turn = (math.atan2(e.y - H / 2, e.x - W / 2), self.view_rot)
+
+    def on_turn(self, e):
+        t = getattr(self, '_turn', None)
+        if not t: return
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        a = math.atan2(e.y - H / 2, e.x - W / 2)
+        self.set_rot(t[1] - (a - t[0]))
 
     def curve_of(self, i):
         tr = self.p.tracks[i]
@@ -1351,14 +1556,12 @@ class Studio(tk.Toplevel):
             self.p._cache[ck] = (key, self.p.track_curve(tr, spacing=max(0.5, self.p.px)))
         return self.p._cache[ck][1]
 
-    def render(self):
-        c = self.canvas
-        if self.pil is None or not c.winfo_ismapped(): return
-        W, H = c.winfo_width(), c.winfo_height()
-        if W < 4 or H < 4: return
+    def compose(self, bx0, by0, bx1, by1):
+        """The picture for the screen box (bx0, by0)-(bx1, by1) at the current view."""
         px = self.p.px
-        x0, z0 = self.c2w(0, 0); x1, z1 = self.c2w(W, H)
-        img = self.pil.transform((W, H), Image.EXTENT, (x0 / px, z0 / px, x1 / px, z1 / px),
+        size = (bx1 - bx0, by1 - by0)
+        ox, oz = self.vs_origin()
+        img = self.pil.transform(size, Image.AFFINE, self.affine((bx0, by0), 1 / px, 1 / px, ox, oz),
                                  resample=Image.BILINEAR if self.mpp > px else Image.NEAREST, fillcolor=(32, 36, 42))
         ref = self.p.reference
         if ref.get('visible') and ref.get('path'):
@@ -1367,17 +1570,100 @@ class Studio(tk.Toplevel):
                     self.ref_img = (ref['path'], Image.open(ref['path']).convert('RGB'))
                 ri = self.ref_img[1]
                 sx, sy = ri.width / self.p.size, ri.height / self.p.size
-                r = ri.transform((W, H), Image.EXTENT, (x0 * sx, z0 * sy, x1 * sx, z1 * sy), resample=Image.BILINEAR,
+                r = ri.transform(size, Image.AFFINE, self.affine((bx0, by0), sx, sy, ox, oz), resample=Image.BILINEAR,
                                  fillcolor=(32, 36, 42))
                 img = Image.blend(img, r, float(ref.get('opacity', 0.5)))
             except Exception:
                 pass
+        return img
+
+    def render(self):
+        c = self.canvas
+        if self.pil is None or not c.winfo_ismapped(): return
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 4 or H < 4: return
+        self._cancel_render()
+        img = self.compose(0, 0, W, H)
+        self._shown = img
         self._tk = ImageTk.PhotoImage(img)
         c.delete('all')
         c.create_image(0, 0, image=self._tk, anchor='nw')
-        bx0, by0 = self.w2c(0, 0); bx1, by1 = self.w2c(self.p.size, self.p.size)
-        c.create_rectangle(bx0, by0, bx1, by1, outline='#9aa')
+        ox, oz = self.vs_origin()
+        c.create_polygon(*self.poly_of(ox, oz, ox + self.p.size, oz + self.p.size), outline='#9aa', fill='')
         self.draw_overlays(c, W, H)
+        self.draw_compass(c, W, H)
+        self._rendered()
+
+    def draw_compass(self, c, W, H):
+        """North arrow (click: north up) - shows how the view is turned."""
+        x, y, r = W - 30, 30, 16
+        s_, co = math.sin(self.view_rot), math.cos(self.view_rot)
+        dx, dy = -s_ * r, -co * r                         # +z (north) on screen
+        c.create_oval(x - r - 4, y - r - 4, x + r + 4, y + r + 4, fill='#2a2e35', outline='#888', tags=('compass',))
+        c.create_line(x - dx * 0.7, y - dy * 0.7, x + dx, y + dy, fill='#ff5a5a', width=3, arrow='last', tags=('compass',))
+        c.create_text(x + dx * 1.45, y + dy * 1.45, text='N', fill='#ffd0d0', font=('Segoe UI', 8, 'bold'), tags=('compass',))
+        c.tag_bind('compass', '<Button-1>', lambda e: (self.north_up(), 'break')[1])
+
+    # ---- smooth views: draw only what changed, slide the picture while panning, merge quick redraws
+    def _rendered(self):
+        self._drawn = (self.vx, self.vz, self.mpp, self.canvas.winfo_width(), self.canvas.winfo_height(), self.view_rot)
+        self._shifted = (0.0, 0.0)
+
+    def _cancel_render(self):
+        if self._render_job:
+            try: self.after_cancel(self._render_job)
+            except Exception: pass
+            self._render_job = None
+
+    def request_render(self, delay=1):
+        """Redraw soon - many requests in a row (mouse moves, wheel turns) make one redraw."""
+        if self._render_job: return
+        self._render_job = self.after(max(1, int(delay)), self._do_render)
+
+    def _do_render(self):
+        self._render_job = None
+        self.render()
+
+    def quick_shift(self):
+        """Pan: slide what is on screen to the new view at once; the full redraw follows a moment later."""
+        d = self._drawn
+        if d is None or abs(d[2] - self.mpp) > 1e-12 or abs(d[5] - self.view_rot) > 1e-12:
+            self.request_render(); return
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        sx, sy = self.vs2c(d[0], d[1]); dx, dy = sx - W / 2, sy - H / 2
+        self.canvas.move('all', dx - self._shifted[0], dy - self._shifted[1])
+        self._shifted = (dx, dy)
+        self.request_render(70)
+
+    def win_rect(self, win):
+        """A window of the heightmap (rows = z, cols = x) as an area-local rectangle (x0, z0, x1, z1)."""
+        px = self.p.px
+        return win[1].start * px, win[0].start * px, win[1].stop * px, win[0].stop * px
+
+    def screen_box(self, x0, z0, x1, z1, pad=2):
+        W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
+        pts = [self.w2c(x, z) for x, z in ((x0, z0), (x1, z0), (x1, z1), (x0, z1))]
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        bx0, bx1 = max(0, int(math.floor(min(xs))) - pad), min(W, int(math.ceil(max(xs))) + pad)
+        by0, by1 = max(0, int(math.floor(min(ys))) - pad), min(H, int(math.ceil(max(ys))) + pad)
+        return (bx0, by0, bx1, by1) if bx1 > bx0 and by1 > by0 else None
+
+    def patch_render(self, win):
+        """Redraw just the part of the view a brush dab changed. False = a full redraw is needed."""
+        c = self.canvas
+        d = self._drawn
+        if (getattr(self, '_tk', None) is None or getattr(self, '_shown', None) is None or d is None or self._render_job
+                or d != (self.vx, self.vz, self.mpp, c.winfo_width(), c.winfo_height(), self.view_rot)
+                or self._shifted != (0.0, 0.0)):
+            return False
+        box = self.screen_box(*self.win_rect(win))
+        if box is None: return True
+        sub = self.compose(*box)
+        self._shown.paste(sub, box[:2])
+        patch = ImageTk.PhotoImage(sub)
+        c.tk.call(str(self._tk), 'copy', str(patch), '-to', box[0], box[1])
+        self._patch_keep = patch
+        return True
 
     def draw_overlays(self, c, W, H):
         tab = self.tab()
@@ -1511,18 +1797,21 @@ class Studio(tk.Toplevel):
         self.mpp *= 1 / 1.2 if up else 1.2
         self.mpp = min(max(self.mpp, self.p.px / 8), self.p.size / 100)
         nx, nz = self.c2w(e.x, e.y); self.vx += x - nx; self.vz += z - nz
-        self.render()
+        self.request_render()
 
     def on_pan_start(self, e): self._pan = (e.x, e.y, self.vx, self.vz, False)
 
     def on_pan(self, e):
         if not getattr(self, '_pan', None): return
         sx, sy, vx, vz, _ = self._pan
-        self.vx = vx - (e.x - sx) * self.mpp; self.vz = vz + (e.y - sy) * self.mpp
-        self._pan = (sx, sy, vx, vz, True); self.render()
+        c, s_ = math.cos(self.view_rot), math.sin(self.view_rot)
+        a, b = (e.x - sx) * self.mpp, -(e.y - sy) * self.mpp
+        self.vx = vx - (a * c + b * s_); self.vz = vz - (-a * s_ + b * c)
+        self._pan = (sx, sy, vx, vz, True); self.quick_shift()
 
     def on_pan_end(self, e):
         p = getattr(self, '_pan', None); self._pan = None
+        if p and p[4]: self.render()
         if p and not p[4] and self.tab() == 'Track': self.track_menu(e)
 
     def on_right(self, e):
@@ -1568,13 +1857,15 @@ class Studio(tk.Toplevel):
         elif k in ('rut_pt',): self.rut_pt_drag(x, z)
         elif k == 'free': self.free_drag(x, z)
         elif k == 'sculpt': self.sculpt_drag(x, z)
-        elif k == 'ramp': d['b'] = (x, z); self.render()
+        elif k == 'ramp': d['b'] = (x, z); self.request_render()
 
     def on_up(self, e):
         d = self._drag; self._drag = None
         if not d: return
         k = d['kind']
-        if k == 'pan': self._pan = None
+        if k == 'pan':
+            moved = bool(getattr(self, '_pan', None) and self._pan[4]); self._pan = None
+            if moved: self.render()
         elif k in ('point', 'jump', 'rut_pt'):
             if d.get('moved'): self.p._cache.pop(('tf', d.get('track')), None); self.recompute()
         elif k == 'free': self.free_end(d)
@@ -1664,7 +1955,7 @@ class Studio(tk.Toplevel):
             ref = tr['points'][j - 1] if j > 0 else tr['points'][j + 1]
             x, z = self._snap45(x, z, ref)
         tr['points'][j][0] = min(max(x, 0), self.p.size); tr['points'][j][1] = min(max(z, 0), self.p.size)
-        d['moved'] = True; self.render()
+        d['moved'] = True; self.request_render()
 
     def track_menu(self, e):
         hp = self.hit_point(e.x, e.y)
@@ -1754,7 +2045,7 @@ class Studio(tk.Toplevel):
             ang = math.degrees(math.atan2(z - jp['z'], x - jp['x']))
             if e.state & 0x1: ang = round(ang / 15) * 15
             jp['heading'] = ang % 360
-            d['moved'] = True; self.jform.load(jp); self.render(); self._live_eval(); return
+            d['moved'] = True; self.jform.load(jp); self.request_render(); self._live_eval(); return
         if d.get('free'):
             a = math.radians(jp.get('heading', 0))
             dx, dz = x - d['start'][0], z - d['start'][1]
@@ -1762,7 +2053,7 @@ class Studio(tk.Toplevel):
                 jp['length'] = max(1.0, d['L0'] + 2 * (dx * math.cos(a) + dz * math.sin(a)))
             else:
                 jp['x'], jp['z'] = d['xz0'][0] + dx, d['xz0'][1] + dz
-            d['moved'] = True; self.jform.load(jp); self.render(); self._live_eval(); return
+            d['moved'] = True; self.jform.load(jp); self.request_render(); self._live_eval(); return
         cur = self.curve_of(jp['track'])
         if cur is None: return
         Cc, T, s = cur[:3]
@@ -1771,7 +2062,7 @@ class Studio(tk.Toplevel):
             jp['length'] = max(1.0, d['L0'] + 2 * abs(sv - d['s0']) - 2 * abs(d['grab'] - d['s0']))
         else:
             jp['s'] = self.snap_s(min(max(d['s0'] + sv - d['grab'], 0), float(s[-1])))
-        d['moved'] = True; self.jform.load(jp); self.draw_jump_shape(); self.render()
+        d['moved'] = True; self.jform.load(jp); self.draw_jump_shape(); self.request_render()
         self._live_eval()
 
     def _live_eval(self):
@@ -1824,7 +2115,7 @@ class Studio(tk.Toplevel):
     def rut_pt_drag(self, x, z):
         r = self.cur_rut()
         if r is None: return
-        r['points'][self._drag['j']] = [x, z]; self._drag['moved'] = True; self.render()
+        r['points'][self._drag['j']] = [x, z]; self._drag['moved'] = True; self.request_render()
 
     def free_drag(self, x, z):
         pts = self._drag['pts']
@@ -1855,7 +2146,7 @@ class Studio(tk.Toplevel):
     def sculpt_down(self, e, x, z):
         if self.H is None: return
         if self.tab() in ('Surface', 'Nature'):
-            self._drag = {'kind': 'sculpt', 'paint': self.tab(), 'old': {k: getattr(self.p, k).copy() for k in ('surf', 'canopy', 'rocks')},
+            self._drag = {'kind': 'sculpt', 'paint': self.tab(), 'old': {k: getattr(self.p, k).copy() for k in ('surf', 'canopy', 'rocks', 'smix')},
                           'win': None, 'last': None, 'rng': np.random.default_rng(), 'erase': bool(e.state & 0x4),
                           'angle': 0.0}
             self.sculpt_drag(x, z); return
@@ -1922,7 +2213,7 @@ class Studio(tk.Toplevel):
     def sculpt_end(self, d):
         if d['win'] is None: return
         if d['paint']:
-            self.hist.push_arrays([(k, d['win'], d['old'][k][d['win']].copy()) for k in ('surf', 'canopy', 'rocks')])
+            self.hist.push_arrays([(k, d['win'], d['old'][k][d['win']].copy()) for k in ('surf', 'canopy', 'rocks', 'smix')])
         else:
             self.hist.push_array(self.sculpt_name(), d['win'], d['old'][d['win']].copy())
             if self.sculpt_name() == 'impkeep': self.after_sculpt('impkeep'); return
@@ -1947,6 +2238,12 @@ class Studio(tk.Toplevel):
             lay = self.paint_layer.get()
             val = -1 if lay.startswith('Automatic') else (-2 if lay.startswith('Keep') else C.SURFACES.index(SURF_BY_NAME[lay]))
             p.surf[win][m] = val
+            mx = SURF_BY_NAME.get(self.mix_layer.get()) if val >= 0 else None
+            amt = int(round(float(self.mix_amt.get()) * 2.55)) if mx else 0
+            if mx and 0 < amt and C.SURFACES.index(mx) != val:
+                p.smix[win][m] = C.SURFACES.index(mx) * 256 + min(amt, 255)
+            else:
+                p.smix[win][m] = -1
         else:
             it = C.nature_item(self.nat_item.get())
             name, surf, can, rk = it[:4]

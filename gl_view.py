@@ -406,6 +406,11 @@ class GLView(OpenGLFrame):
             GL.glEnable(GL.GL_BLEND); GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glDepthMask(GL.GL_FALSE)
             if on_top: GL.glDisable(GL.GL_DEPTH_TEST)
+            else:                                   # x-ray: faintly through your model too, so it never hides
+                GL.glDisable(GL.GL_DEPTH_TEST); GL.glUniform1f(L['uAlpha'], 0.17)
+                for start, count in ghosts:
+                    GL.glDrawElements(GL.GL_TRIANGLES, count, GL.GL_UNSIGNED_INT, GL.ctypes.c_void_p(start * 4))
+                GL.glEnable(GL.GL_DEPTH_TEST); GL.glUniform1f(L['uAlpha'], 0.32)
             for start, count in ghosts:
                 GL.glDrawElements(GL.GL_TRIANGLES, count, GL.GL_UNSIGNED_INT, GL.ctypes.c_void_p(start * 4))
             GL.glDepthMask(GL.GL_TRUE); GL.glDisable(GL.GL_BLEND); GL.glEnable(GL.GL_DEPTH_TEST)
@@ -437,6 +442,22 @@ class GLView(OpenGLFrame):
             GL.glBegin(GL.GL_POINTS)
             for x, y in zip(sx, sy): GL.glVertex2f(x, y)
             GL.glEnd()
+        marks = ed.feature_marks() if hasattr(ed, 'feature_marks') else []
+        if marks:                                   # Auto align: green cross = game bike, pink ring = yours
+            sx, sy, _ = ed.project_np(np.asarray([p for m in marks for p in m], np.float64))
+            GL.glLineWidth(2)
+            for k in range(len(marks)):
+                gx, gy, mx, my = sx[2 * k], sy[2 * k], sx[2 * k + 1], sy[2 * k + 1]
+                GL.glColor3f(1.0, 0.31, 0.85)
+                GL.glBegin(GL.GL_LINES); GL.glVertex2f(gx, gy); GL.glVertex2f(mx, my); GL.glEnd()
+                GL.glBegin(GL.GL_LINE_LOOP)
+                for j in range(16):
+                    a = j * math.pi / 8; GL.glVertex2f(mx + 5 * math.cos(a), my + 5 * math.sin(a))
+                GL.glEnd()
+                GL.glColor3f(0.30, 1.0, 0.48)
+                GL.glBegin(GL.GL_LINES)
+                GL.glVertex2f(gx - 9, gy); GL.glVertex2f(gx + 9, gy); GL.glVertex2f(gx, gy - 9); GL.glVertex2f(gx, gy + 9)
+                GL.glEnd()
         for pv in ed.overlay_pivots():
             sx, sy, _ = ed.project_np(np.asarray([pv], np.float64))
             GL.glLineWidth(2); GL.glColor3f(1, 1, 1)

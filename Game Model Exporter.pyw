@@ -24,8 +24,17 @@ import zigspec  # noqa: E402
 BACKEND = os.path.join(HERE, 'gamemodel_blender.py')
 SPEC_DIR = os.path.join(HERE, 'specs')
 APP = 'Game Model Exporter'
+NO_PRESET = '(none)'
 CFG_DIR = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~/.config'), 'GameModelExporter')
 CFG = os.path.join(CFG_DIR, 'settings.json')
+USER_SPEC_DIR = os.path.join(CFG_DIR, 'specs')        # where "Add spec" keeps the copy of the game's spec file
+
+
+def spec_files():
+    out = []
+    for d in (SPEC_DIR, USER_SPEC_DIR):
+        out += [p for p in sorted(glob.glob(os.path.join(d, '*.zig'))) if p not in out]
+    return out
 AUTO = '(from file name)'
 
 
@@ -97,15 +106,6 @@ def run_lines(cmd, on_line, proc_holder=None):
     return p.wait()
 
 
-def run_lines(cmd, on_line, proc_holder=None):
-    """Run a command, call on_line for each output line; returns exit code."""
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-                         errors='replace', creationflags=0x08000000 if os.name == 'nt' else 0)
-    if proc_holder is not None: proc_holder.append(p)
-    for line in p.stdout: on_line(line.rstrip())
-    return p.wait()
-
-
 def game_model_name(path):
     """'.../bike-4stroke.blend.bin' or '.../bike-4stroke.blend.bin.orig' -> 'bike-4stroke'"""
     b = os.path.basename(path)
@@ -165,7 +165,7 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ specs (picked automatically)
     def load_specs(self):
-        paths = sorted(glob.glob(os.path.join(SPEC_DIR, '*.zig')))
+        paths = spec_files()
         paths += [p for p in self.cfg.get('extra_specs', []) if os.path.isfile(p) and p not in paths]
         for p in paths:
             try: self.specs[p] = zigspec.ZigSpec.load(p)
@@ -174,14 +174,49 @@ class App(tk.Tk):
             self.spec_path = next(iter(self.specs)); self.spec = self.specs[self.spec_path]
         self.fill_spec_tab()
 
+    def spec_for_file(self, path):
+        """The spec for a game file. When a game update gave the files a new version number but the same layout
+        (any change to the game's lists of names changes the number), a matching spec is made automatically."""
+        h = zigspec.sniff_header(path)
+        if not h: return None
+        sp = next((p for p, s in self.specs.items() if s.schema_hash == h), None)
+        if sp: return sp
+        for p in spec_files():
+            if p not in self.specs:
+                try: self.specs[p] = zigspec.ZigSpec.load(p)
+                except Exception: pass
+        sp = next((p for p, s in self.specs.items() if s.schema_hash == h), None)
+        if sp: return sp
+        cands = sorted(self.specs, key=lambda p: ('legacy' in os.path.basename(p).lower(),
+                                                  'auto-' in os.path.basename(p).lower()))
+        self.status.set('The game was updated (file version %s) - checking whether its files still read the same way…' % h)
+        self.update_idletasks()
+        try:
+            out = zigspec.derive_spec(path, cands, USER_SPEC_DIR)
+        except Exception as e:
+            self.status.set("Couldn't check the updated game files: %s" % e); return None
+        if not out:
+            self.status.set('The updated game files (version %s) are laid out differently - a new spec is needed.' % h)
+            return None
+        self.specs[out] = zigspec.ZigSpec.load(out); self.fill_spec_tab()
+        self.status.set('The game was updated (file version %s). Its files are laid out exactly as before, so the tool '
+                        'made a matching spec by itself (%s).' % (h, os.path.basename(out)))
+        return out
+
     def add_spec(self):
         p = filedialog.askopenfilename(title='Choose BlendMeshSpec.zig', filetypes=[('Zig spec', '*.zig')])
         if not p: return
         try: self.specs[p] = zigspec.ZigSpec.load(p)
         except Exception as e:
             messagebox.showerror(APP, 'That file is not a usable spec:\n%s' % e); return
-        extra = self.cfg.setdefault('extra_specs', [])
-        if p not in extra: extra.append(p)
+        try:                                   # keep a copy so the map editor and the Blender add-on find it too
+            os.makedirs(USER_SPEC_DIR, exist_ok=True)
+            q = os.path.join(USER_SPEC_DIR, os.path.basename(p))
+            if os.path.abspath(q) != os.path.abspath(p):
+                shutil.copyfile(p, q); self.specs.pop(p, None); self.specs[q] = zigspec.ZigSpec.load(q); p = q
+        except OSError:
+            extra = self.cfg.setdefault('extra_specs', [])
+            if p not in extra: extra.append(p)
         self.on_inputs()
 
     # ------------------------------------------------------------ main tab
@@ -193,7 +228,20 @@ class App(tk.Tk):
         r = ttk.Frame(s1); r.pack(fill='x')
         ttk.Entry(r, textvariable=self.blend).pack(side='left', fill='x', expand=True)
         ttk.Button(r, text='Browse…', command=self.pick_blend).pack(side='left', padx=(6, 0))
+        self.import_btn = ttk.Button(r, text='Import MX Bikes / MX Sim bike…', command=self.import_bike)
+        self.import_btn.pack(side='left', padx=(6, 0))
+        self.shop_btn = ttk.Button(r, text='Paint & parts…', command=self.open_workshop)
+        self.shop_btn.pack(side='left', padx=(6, 0))
         self.blend_info = ttk.Label(s1, text='', style='Hint.TLabel', wraplength=880); self.blend_info.pack(anchor='w', pady=(4, 0))
+        r = ttk.Frame(s1); r.pack(fill='x', pady=(6, 0))
+        ttk.Label(r, text='Line-up preset').pack(side='left')
+        self.preset = tk.StringVar(value=self.cfg.get('preset', NO_PRESET))
+        self.preset_box = ttk.Combobox(r, textvariable=self.preset, state='readonly', width=46,
+                                       postcommand=self.fill_presets)
+        self.preset_box.pack(side='left', padx=6)
+        ttk.Label(r, text='used when your model has no saved line-up yet (save presets in Edit model)',
+                  style='Hint.TLabel').pack(side='left')
+        self.fill_presets()
 
         s2 = ttk.LabelFrame(f, text=' 2.  Game model to replace ', style='Step.TLabelframe', padding=10)
         s2.pack(fill='x', pady=(10, 0))
@@ -278,6 +326,151 @@ class App(tk.Tk):
         p = filedialog.askopenfilename(title='Your model', filetypes=[('Blender files', '*.blend'), ('All', '*')])
         if p: self.blend.set(os.path.normpath(p))
 
+    # ------------------------------------------------------------ line-up presets
+    def fill_presets(self):
+        import lineup_presets
+        names = [NO_PRESET] + [p['name'] for p in lineup_presets.list_presets()]
+        self.preset_box['values'] = names
+        if self.preset.get() not in names: self.preset.set(NO_PRESET)
+
+    def preset_path(self):
+        import lineup_presets
+        n = self.preset.get()
+        p = lineup_presets.find(n) if n and n != NO_PRESET else None
+        return p['path'] if p else None
+
+    def import_info(self, blend=None):
+        p = (blend or self.blend.get().strip()) + '.import.json'
+        try:
+            with open(p) as fh: return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    # ------------------------------------------------------------ importing MX Bikes / MX Simulator bikes
+    def choose(self, title, text, items):
+        """A small list dialog; returns the chosen item or None."""
+        d = tk.Toplevel(self); d.title(title); d.transient(self); d.grab_set()
+        ttk.Label(d, text=text, wraplength=420, justify='left', padding=(10, 10, 10, 4)).pack(anchor='w')
+        lb = tk.Listbox(d, height=min(14, max(4, len(items))), width=60, activestyle='dotbox')
+        for it in items: lb.insert('end', it)
+        lb.pack(fill='both', expand=True, padx=10); lb.selection_set(0)
+        out = {}
+        def ok(_e=None):
+            s = lb.curselection()
+            if s: out['v'] = items[s[0]]
+            d.destroy()
+        lb.bind('<Double-1>', ok)
+        b = ttk.Frame(d, padding=10); b.pack(fill='x')
+        ttk.Button(b, text='OK', command=ok).pack(side='right')
+        ttk.Button(b, text='Cancel', command=d.destroy).pack(side='right', padx=6)
+        self.wait_window(d)
+        return out.get('v')
+
+    def import_bike(self):
+        """An MX Bikes model.edf or an MX Simulator .saf -> a .blend with the bike assembled, ready to line up."""
+        blender = self.blender.get().strip()
+        if not blender or not os.path.isfile(blender):
+            messagebox.showerror(APP, 'Set the path to blender.exe first.'); return
+        p = filedialog.askopenfilename(title='Import a bike', filetypes=[
+            ('MX Bikes / MX Simulator bikes', '*.edf *.saf'), ('MX Bikes model', '*.edf'),
+            ('MX Simulator bike', '*.saf'), ('All', '*')])
+        if not p: return
+        try:
+            import numpy  # noqa: F401
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            messagebox.showerror(APP, 'Importing bikes needs numpy and pillow (pip install numpy pillow).'); return
+        import bike_import
+        kw, family = {}, None
+        try:
+            if p.lower().endswith('.saf'):
+                family = 'MX Simulator'
+                bikes = bike_import.mxs_bikes(p)
+                if not bikes:
+                    messagebox.showerror(APP, 'No MX Simulator bike models (.jm) in %s - it may be a track or gear.'
+                                         % os.path.basename(p)); return
+                b = bikes[0]
+                if len(bikes) > 1:
+                    k = self.choose('Import a bike', '%s holds %d bikes. Which one?' % (os.path.basename(p), len(bikes)),
+                                    [x['key'] for x in bikes])
+                    if not k: return
+                    b = next(x for x in bikes if x['key'] == k)
+                skins = [sk for sk in b['skins'] if not sk[3]]
+                if len(skins) > 1:
+                    sk = self.choose('Import a bike', 'Which skin (texture)?', [sk[0] for sk in skins])
+                    if not sk: return
+                    kw['skin'] = sk
+                kw['bike_key'] = b['key']
+                self.on_inputs()
+                t = self.template()
+                if not (self.game_ok and t):
+                    messagebox.showerror(APP, 'Step 2 first: pick the game bike to replace. MX Simulator bikes come '
+                                              'as separate parts, and they are put together around the game bike\'s '
+                                              'axles and handlebars.'); return
+                with open(t, 'rb') as fh: kw['boxes'] = bike_import.template_boxes(self.spec.decode(fh.read()))
+            else:
+                family = 'MX Bikes'
+        except Exception as e:
+            messagebox.showerror(APP, 'Could not read %s:\n%s' % (os.path.basename(p), e)); return
+        self.set_busy(True); self.import_btn.configure(state='disabled')
+        self.status.set('Importing %s…' % os.path.basename(p))
+        self.write_log('▶ importing %s (%s)' % (os.path.basename(p), family))
+
+        def work():
+            try:
+                if family == 'MX Simulator':
+                    parts, tex, info = bike_import.load_mxs(p, **kw)
+                else:
+                    parts, tex, info = bike_import.load_edf(p)
+                name = info['key'] if family == 'MX Bikes' else '%s %s' % (info.get('model'), info.get('skin') or '')
+                name = ' '.join(name.split())
+                folder = bike_import.import_folder(name.strip())
+                jp = bike_import.write_parts(folder, parts, tex)
+                out = os.path.join(folder, re.sub(r'[^A-Za-z0-9_.-]+', '_', name.strip()) + '.blend')
+                cmd = [blender, '-b', '--factory-startup', '--python-exit-code', '1', '--python', BACKEND, '--',
+                       '--build-parts', jp, '--save-blend', out]
+                lines = []
+                code = run_lines(cmd, lines.append)
+                if not os.path.isfile(out):
+                    self.q.put(('log', '  ✘ Blender could not build the model:', 'err'))
+                    for line in lines[-12:]: self.q.put(('log', '    ' + line, 'err'))
+                    self.q.put(('finish', 'Import failed.')); return
+                with open(out + '.import.json', 'w') as fh:
+                    json.dump({'family': family, 'source': p, 'bike': info.get('key'), 'skin': info.get('skin'),
+                               'notes': info.get('notes', [])}, fh, indent=1)
+                for n in info.get('notes', []): self.q.put(('log', '  · ' + n, 'dim'))
+                self.q.put(('log', '  ✔ %s - %d parts, saved as %s' % (info.get('key'), len(parts), out), 'ok'))
+                self.q.put(('call', lambda: self.after_import(out, family)))
+                self.q.put(('finish', 'Imported %s.' % info.get('key')))
+            except Exception as e:
+                self.q.put(('log', '  ✘ %s' % e, 'err')); self.q.put(('finish', 'Import failed.'))
+            finally:
+                self.q.put(('call', lambda: self.import_btn.configure(state='normal')))
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_workshop(self, blend=None):
+        """Paint / parts live in Edit model (3D): open it on its Paint tab."""
+        b = self.blend.get().strip()
+        if not b or not os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(b)), 'parts.json')):
+            messagebox.showinfo(APP, 'Painting and parts work on bikes brought in with "Import MX Bikes / MX Sim bike…" - '
+                                     'import one first (or pick one from Documents\\GameModelExporter\\imports).')
+            return
+        self.align(start_mode='paint')
+
+    def after_import(self, blend, family):
+        import lineup_presets
+        self.blend.set(os.path.normpath(blend))
+        self.fill_presets()
+        pr = lineup_presets.best_for(family, self.model() if self.game_ok else None)
+        self.write_log('  paint it, or delete / add parts: "Paint & parts…" (or the Paint tab in Edit model)', 'dim')
+        if pr:
+            self.preset.set(pr['name'])
+            self.write_log('  using your line-up preset "%s" - open Edit model to check it' % pr['name'], 'ok')
+        else:
+            self.preset.set(NO_PRESET)
+            self.write_log('  next: Edit model → Auto align, adjust, then "Save as line-up preset" - every %s bike '
+                           'after this one lines up the same way' % family, 'dim')
+
     def pick_game(self):
         p = filedialog.askopenfilename(title='Game model to replace',
                                        filetypes=[('Game model', '*.blend.bin *.bin *.orig'), ('All', '*')])
@@ -359,10 +552,11 @@ class App(tk.Tk):
         h = zigspec.sniff_header(t)
         if not h:
             self.game_info.configure(text='Not a game model file (no BinarySerializer header).', style='Bad.TLabel'); return
-        sp = next((p for p, s in self.specs.items() if s.schema_hash == h), None)
+        sp = self.spec_for_file(t)
         if sp is None:
-            self.game_info.configure(text='Game file version %s - no spec for it. Ask the dev for the matching '
-                                          'BlendMeshSpec.zig and add it on the Spec tab.' % h, style='Bad.TLabel'); return
+            self.game_info.configure(text='Game file version %s - no spec for it, and its layout differs from every '
+                                          'spec the tool has. Ask the dev for the matching BlendMeshSpec.zig and add '
+                                          'it on the Spec tab.' % h, style='Bad.TLabel'); return
         if self.spec_path != sp:
             self.spec_path, self.spec = sp, self.specs[sp]; self.fill_spec_tab()
         m = self.model()
@@ -444,6 +638,8 @@ class App(tk.Tk):
         if o['subdiv']: cmd.append('--defer-subdiv')
         if o['mirror']: cmd.append('--mirror')
         cmd += ['--finish', FINISH_KEYS.get(self.finish.get(), 'satin')]
+        pp = self.preset_path()
+        if pp: cmd += ['--preset', pp]
         return cmd, o
 
     def set_busy(self, b):
@@ -514,7 +710,7 @@ class App(tk.Tk):
         self.q.put(('finish', msg))
 
     # ------------------------------------------------------------ 3D alignment
-    def align(self):
+    def align(self, start_mode='lineup'):
         missing = []
         for mod, pkg in (('numpy', 'numpy'), ('PIL.ImageTk', 'pillow'), ('OpenGL.GL', 'PyOpenGL'),
                          ('pyopengltk', 'pyopengltk')):
@@ -568,7 +764,8 @@ class App(tk.Tk):
                     self.q.put(('log', '  ' + line[5:], 'dim'))
             self.q.put(('finish', 'Opened the 3D alignment view.'))
             import align_editor
-            self.q.put(('call', lambda: align_editor.AlignEditor(self, blend, model, data, self.map_path(blend))))
+            self.q.put(('call', lambda: align_editor.AlignEditor(self, blend, model, data, self.map_path(blend),
+                                                                 start_mode=start_mode)))
         threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ map editor
@@ -649,14 +846,11 @@ class App(tk.Tk):
         root = os.path.dirname(os.path.dirname(meshes))
         spec = None
         try:
-            hdr = zigspec.sniff_header(mp)
-            for f in sorted(glob.glob(os.path.join(SPEC_DIR, '*.zig'))):
-                s = zigspec.ZigSpec.load(f)
-                if s.schema_hash == hdr: spec = f; break
+            spec = self.spec_for_file(zigspec.original_of(mp) or mp)
         except Exception:
             pass
         if not spec:
-            messagebox.showerror(APP, "The map file is a different version than the spec files in the specs folder.")
+            messagebox.showerror(APP, "No spec file matches this map file. Add the game's BlendMeshSpec.zig on the Spec tab (see README: SPEC FILE).")
             return
         self.ensure_libs((('OpenGL', 'PyOpenGL'), ('pyopengltk', 'pyopengltk'), ('tkinterdnd2', 'tkinterdnd2')),
                          "The map editor's 3D view and drag-and-drop")
@@ -860,7 +1054,7 @@ class App(tk.Tk):
 
     def persist(self):
         self.cfg.update(blender=self.blender.get(), blend=self.blend.get(), game=self.game.get(),
-                        save_copy=self.save_copy.get(), copy_path=self.copy_path.get(),
+                        save_copy=self.save_copy.get(), copy_path=self.copy_path.get(), preset=self.preset.get(),
                         bring_tex=self.bring_tex.get(), finish=self.finish.get(), tex_slot=self.tex_slot.get(), tex_file=self.tex_file.get(),
                         **{'opt_' + k: v.get() for k, v in self.opt.items()})
         save_cfg(self.cfg)

@@ -1,7 +1,8 @@
 """
 hm_gl.py - the heightmap studio's live 3D view (OpenGL via pyopengltk): the heightmap as a lit terrain
 mesh with the surface colours, optional slope shading and 10 m grid, and a display-only height
-exaggeration. Left-drag orbits, right/middle-drag pans, wheel zooms, double-click centres on that spot.
+exaggeration. Editing tabs: left-drag edits on the terrain (brushes, track points...), right-drag turns the view;
+otherwise left-drag turns it. Middle- or Shift+right-drag moves it, wheel zooms, double-click centres there.
 """
 import math
 import sys
@@ -84,9 +85,13 @@ class TerrainGL(OpenGLFrame):
         self.ctx = None; self._dirty_ctx = False; self.cmesh = None   # surrounding ground (heights, rgb, x0, z0, size)
         self.unbind('<Configure>')
         self.bind('<Configure>', self._on_resize, add='+')
-        self.bind('<ButtonPress-1>', self._down); self.bind('<B1-Motion>', self._orbit)
-        for b in ('<ButtonPress-2>', '<ButtonPress-3>'): self.bind(b, self._down)
-        for b in ('<B2-Motion>', '<B3-Motion>'): self.bind(b, self._pan)
+        self.owner = None           # the studio: editing in 3D (brushes, tracks...) and the 2D view's turning
+        self._edit = False
+        self.bind('<ButtonPress-1>', self._b1_down); self.bind('<B1-Motion>', self._b1_drag)
+        self.bind('<ButtonRelease-1>', self._b1_up)
+        self.bind('<ButtonPress-2>', self._down); self.bind('<B2-Motion>', self._pan)
+        self.bind('<ButtonPress-3>', self._down); self.bind('<B3-Motion>', self._b3_drag)
+        self.bind('<Motion>', self._hover); self.bind('<Leave>', lambda e: self._hover(None))
         self.bind('<MouseWheel>', lambda e: self.zoom(0.88 if e.delta > 0 else 1 / 0.88))
         self.bind('<Button-4>', lambda e: self.zoom(0.88)); self.bind('<Button-5>', lambda e: self.zoom(1 / 0.88))
         self.bind('<Double-Button-1>', self._focus)
@@ -107,6 +112,18 @@ class TerrainGL(OpenGLFrame):
         """The ground around the edited area (coordinates relative to the area's corner), drawn around it."""
         self.ctx = (np.ascontiguousarray(Hc, np.float32), np.ascontiguousarray(rgbc[..., :3], np.uint8), float(x0), float(z0), float(size))
         self._dirty_ctx = True; self.request()
+
+    def update_window(self, H, rgb, size, win):
+        """Only a window (rows, cols) of the same map changed: upload just that part. False = use set_data."""
+        if (self.H is None or self._dirty_h or self._dirty_c or H.shape != self.H.shape
+                or abs(float(size) - self.size) > 1e-6):
+            return False
+        r0, r1, c0, c1 = win[0].start, win[0].stop, win[1].start, win[1].stop
+        self.H[r0:r1, c0:c1] = H[r0:r1, c0:c1]; self.rgb[r0:r1, c0:c1] = rgb[r0:r1, c0:c1, :3]
+        d = getattr(self, '_dirty_win', None)
+        self._dirty_win = (r0, r1, c0, c1) if d is None else (min(d[0], r0), max(d[1], r1), min(d[2], c0), max(d[3], c1))
+        self.request()
+        return True
 
     def update_region(self, H, rgb):
         self.H = H; self.rgb = rgb; self._dirty_h = self._dirty_c = True; self.request()
@@ -206,10 +223,51 @@ class TerrainGL(OpenGLFrame):
 
     def _down(self, e): self._last = (e.x, e.y)
 
+    def editing(self):
+        o = self.owner
+        return o is not None and hasattr(o, 'edit3d') and o.edit3d()
+
+    def _b1_down(self, e):
+        self._last = (e.x, e.y); self._edit = False
+        if self.editing():
+            pt = self.ground_at(e.x, e.y)
+            if pt is not None:
+                self._edit = True; self.owner.gl_edit('down', pt, e)
+
+    def _b1_drag(self, e):
+        if self._edit:
+            pt = self.ground_at(e.x, e.y)
+            if pt is not None:
+                self._cursor = pt; self.owner.gl_edit('drag', pt, e)
+            return
+        self._orbit(e)
+
+    def _b1_up(self, e):
+        if self._edit:
+            self._edit = False
+            pt = self.ground_at(e.x, e.y)
+            self.owner.gl_edit('up', pt, e)
+
+    def _b3_drag(self, e):
+        # editing tabs: right-drag turns the view (left-drag edits); Shift+right-drag always moves it
+        if self.editing() and not (e.state & 0x1): self._orbit(e)
+        else: self._pan(e)
+
+    def _hover(self, e):
+        pt = None if e is None or self.H is None else self.ground_at(e.x, e.y)
+        if pt != getattr(self, '_cursor', None):
+            self._cursor = pt
+            if self.owner is not None and hasattr(self.owner, 'gl_hover'): self.owner.gl_hover(pt, e)
+            self.request()
+
+    def turned(self):
+        if self.owner is not None and hasattr(self.owner, 'gl_turned'): self.owner.gl_turned(self.yaw)
+
     def _orbit(self, e):
         dx, dy = e.x - self._last[0], e.y - self._last[1]; self._last = (e.x, e.y)
         if self.mirror: dx = -dx
         self.yaw += dx * 0.008; self.pitch = min(1.55, max(0.03, self.pitch + dy * 0.006)); self.request()
+        self.turned()
 
     def _pan(self, e):
         dx, dy = e.x - self._last[0], e.y - self._last[1]; self._last = (e.x, e.y)
@@ -218,6 +276,7 @@ class TerrainGL(OpenGLFrame):
         f = np.array([-math.cos(self.yaw), 0, -math.sin(self.yaw)]); r = np.array([math.sin(self.yaw), 0, -math.cos(self.yaw)])
         self.target = self.target - r * dx * k + f * dy * k
         self.request()
+        if self.owner is not None and hasattr(self.owner, 'gl_moved'): self.owner.gl_moved(self.target)
 
     def zoom(self, f):
         self.dist = min(self.size * 4, max(2.0, self.dist * f)); self.request()
@@ -232,11 +291,59 @@ class TerrainGL(OpenGLFrame):
         a = Mi @ [x, y, -1, 1]; b = Mi @ [x, y, 1, 1]; a = a[:3] / a[3]; b = b[:3] / b[3]
         d = (b - a); d /= np.linalg.norm(d)
         n = self.H.shape[0]; px = self.size / (n - 1)
-        for t in np.linspace(0, self.dist * 4, 1600):
-            p = a + d * t
-            if 0 <= p[0] <= self.size and 0 <= p[2] <= self.size:
-                if p[1] <= (self.H[int(p[2] / px), int(p[0] / px)] - self.mid) * self.exag: return float(p[0]), float(p[2])
-        return None
+        t = np.linspace(0, self.dist * 4 + self.size * 2, 4000)
+        P = a[None, :] + d[None, :] * t[:, None]
+        ins = (P[:, 0] >= 0) & (P[:, 0] <= self.size) & (P[:, 2] >= 0) & (P[:, 2] <= self.size)
+        if not ins.any(): return None
+        k = np.nonzero(ins)[0]
+        h = (self.H[np.clip((P[k, 2] / px).astype(int), 0, n - 1), np.clip((P[k, 0] / px).astype(int), 0, n - 1)]
+             - self.mid) * self.exag
+        below = np.nonzero(P[k, 1] <= h)[0]
+        if not len(below): return None
+        j = k[below[0]]
+        if j > 0:                                     # refine between the last step above and the first below
+            lo, hi = t[j - 1], t[j]
+            for _ in range(12):
+                m = (lo + hi) / 2; q = a + d * m
+                hh = (self.H[min(n - 1, max(0, int(q[2] / px))), min(n - 1, max(0, int(q[0] / px)))] - self.mid) * self.exag
+                if q[1] <= hh: hi = m
+                else: lo = m
+            q = a + d * hi
+            return float(min(self.size, max(0.0, q[0]))), float(min(self.size, max(0.0, q[2])))
+        return float(P[j, 0]), float(P[j, 2])
+
+    def height_at(self, x, z):
+        n = self.H.shape[0]; px = self.size / (n - 1)
+        i = np.clip(np.round(np.asarray(z) / px).astype(int), 0, n - 1); j = np.clip(np.round(np.asarray(x) / px).astype(int), 0, n - 1)
+        return (self.H[i, j] - self.mid) * self.exag
+
+    def _overlay(self, M):
+        """Tracks, points, jumps and the brush ring, drawn on the terrain (from the studio)."""
+        o = self.owner
+        if o is None or not hasattr(o, 'overlay3d') or self.H is None: return
+        try: ov = o.overlay3d(getattr(self, '_cursor', None))
+        except Exception as e:
+            print('3D overlay:', e, file=sys.stderr); return
+        if not ov: return
+        GL.glUseProgram(0)
+        GL.glMatrixMode(GL.GL_PROJECTION); GL.glLoadMatrixf(np.ascontiguousarray(M.T, np.float32))
+        GL.glMatrixMode(GL.GL_MODELVIEW); GL.glLoadIdentity()
+        GL.glDisable(GL.GL_DEPTH_TEST); GL.glEnable(GL.GL_BLEND); GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glEnable(GL.GL_LINE_SMOOTH); GL.glEnable(GL.GL_POINT_SMOOTH)
+        lift = 0.15 * max(1.0, self.exag)
+        for pts, col, w in ov.get('lines', []):
+            P = np.asarray(pts, np.float64).reshape(-1, 2)
+            if len(P) < 2: continue
+            y = self.height_at(P[:, 0], P[:, 1]) + lift
+            GL.glLineWidth(w); GL.glColor4f(*col)
+            GL.glBegin(GL.GL_LINE_STRIP)
+            for (x, z), yy in zip(P.tolist(), y.tolist()): GL.glVertex3f(x, yy, z)
+            GL.glEnd()
+        for (x, z), col, size in ov.get('points', []):
+            GL.glPointSize(size); GL.glColor4f(*col)
+            GL.glBegin(GL.GL_POINTS); GL.glVertex3f(x, float(self.height_at(x, z)) + lift, z); GL.glEnd()
+        GL.glDisable(GL.GL_BLEND); GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glMatrixMode(GL.GL_PROJECTION); GL.glLoadIdentity(); GL.glMatrixMode(GL.GL_MODELVIEW)
 
     def _focus(self, e):
         if self.H is None: return
@@ -299,6 +406,15 @@ class TerrainGL(OpenGLFrame):
             m = min(n, 1025)
             if self.mesh is None or self.mesh_m != m: self._make_mesh(m)
             GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+            dw = getattr(self, '_dirty_win', None); self._dirty_win = None
+            if dw is not None and not (self._dirty_h or self._dirty_c):
+                r0, r1, c0, c1 = dw
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self.th)
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, c0, r0, c1 - c0, r1 - r0, GL.GL_RED, GL.GL_FLOAT,
+                                   np.ascontiguousarray(self.H[r0:r1, c0:c1]))
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self.tc)
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, c0, r0, c1 - c0, r1 - r0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE,
+                                   np.ascontiguousarray(self.rgb[r0:r1, c0:c1]))
             if self._dirty_h:
                 GL.glBindTexture(GL.GL_TEXTURE_2D, self.th)
                 GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_R32F, n, n, 0, GL.GL_RED, GL.GL_FLOAT, self.H)
@@ -340,6 +456,7 @@ class TerrainGL(OpenGLFrame):
                     self._dirty_ctx = False
                 draw(self.cth, self.ctc, self.cmesh, cn, cx0, cz0, csz, True)
             GL.glDisableVertexAttribArray(0); GL.glUseProgram(0); GL.glActiveTexture(GL.GL_TEXTURE0)
+            self._overlay(M)
         if self._fbo:
             GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self._fbo[0]); GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, 0)
             GL.glBlitFramebuffer(0, 0, W, Hh, 0, 0, W, Hh, GL.GL_COLOR_BUFFER_BIT, GL.GL_NEAREST)

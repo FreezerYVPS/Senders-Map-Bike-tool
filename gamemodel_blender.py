@@ -1281,13 +1281,14 @@ def build_document_mapped(context, spec, mapping, reference, opts, log=print):
 
 
 TEMPLATE_DIR = os.path.join(_HERE, 'templates')
+_USER_SPECS = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~/.config'), 'GameModelExporter', 'specs')
 
 
 def _decode_any(data, spec, spec_dir):
     """Decode a game file with whichever spec matches its header (the template may be another version)."""
     if data.startswith(spec.header): return spec.decode(data)
     h = zigspec.sniff_header(data)
-    for d in (spec_dir, os.path.join(_HERE, 'specs')):
+    for d in (spec_dir, os.path.join(_HERE, 'specs'), _USER_SPECS):
         if not d or not os.path.isdir(d): continue
         for f in sorted(os.listdir(d)):
             if f.endswith('.zig'):
@@ -1629,10 +1630,14 @@ def _same_pieces(mp, scan):
     return all(o in used or o in mp.get('unused', []) for o in n_isl)
 
 
+_PRESET = None                                   # --preset: a saved line-up for freshly matched models
+
+
 def get_mapping(context, spec, model, ref, mapping_path, remap, pivots, opts, log):
     """Saved mapping if it still fits the scene, else a fresh automatic one. Returns (mapping, scan, saved?)"""
     scan = scan_scene(context, log=log, opts=opts)
     fp = fingerprint(scan)
+    keep_from = None
     if mapping_path and os.path.isfile(mapping_path) and not remap:
         with open(mapping_path) as f: mp = json.load(f)
         if mp.get('version') != MAPPING_VERSION:
@@ -1648,12 +1653,30 @@ def get_mapping(context, spec, model, ref, mapping_path, remap, pivots, opts, lo
                 % os.path.basename(mapping_path))
             return mp, scan, True
         elif mp.get('model') == model:
-            log('WARN the .blend changed since the matching was reviewed - matched again automatically')
+            names = {o['name'] for o in scan['objects']}
+            used = {src[0] for u in mp.get('units', []) for sp in u.get('splits', []) for src in sp.get('sources', [])}
+            if used and used <= names and (mp.get('adjust') or mp.get('fit')):
+                keep_from = mp                      # same objects (e.g. a rebuilt imported bike): keep the line-up
+            else:
+                log('WARN the .blend changed since the matching was reviewed - matched again automatically')
     mp = automap.automap(scan, model, spec.models.get(model, []), ref, pivots=pivots,
                          split_parts=opts.get('split_parts', True))
     mp['fingerprint'] = fp
     mp['version'] = MAPPING_VERSION
     mp['mirror'] = bool(opts.get('mirror'))
+    if keep_from is not None:
+        import lineup_presets
+        what = lineup_presets.apply(mp, keep_from)
+        log('INFO the .blend changed (pieces added or removed) - matched again, keeping your line-up (%s)' % what)
+        return mp, scan, False
+    if _PRESET and os.path.isfile(_PRESET):
+        try:
+            import lineup_presets
+            pr = lineup_presets.load(_PRESET)
+            what = lineup_presets.apply(mp, pr)
+            log('INFO line-up preset "%s" used (%s)' % (pr.get('name'), what))
+        except Exception as e:
+            log('WARN could not use the line-up preset: %s' % e)
     return mp, scan, False
 
 
@@ -1755,6 +1778,65 @@ def _make_material(name, m):
     return mat
 
 
+def build_parts(context, json_path, log=print):
+    """A scene from bike_import's parts folder (game axes, metres) - one object per part, textured."""
+    import numpy as np
+    folder = os.path.dirname(os.path.abspath(json_path))
+    with open(json_path) as f: meta = json.load(f)
+    arr = np.load(os.path.join(folder, 'parts.npz'))
+    for ob in list(bpy.data.objects): bpy.data.objects.remove(ob, do_unlink=True)
+    coll = context.scene.collection
+    mats = {}
+    for key, fn in (meta.get('images') or {}).items():
+        mat = bpy.data.materials.new(key); mat.use_nodes = True
+        nt = mat.node_tree; bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
+        img = bpy.data.images.load(os.path.join(folder, fn), check_existing=True)
+        node = nt.nodes.new('ShaderNodeTexImage'); node.image = img
+        nt.links.new(node.outputs['Color'], bsdf.inputs['Base Color'])
+        mats[key] = mat
+    plain = None
+    # parts going to the same game part become one object named after it (frame, handlebars.top, ...): the matching
+    # then puts them there by name, the same for every imported bike - so one line-up preset fits them all
+    groups, order = {}, []
+    for i, p in enumerate(meta['parts']):
+        key = p.get('unit') or p['name']
+        if key not in groups: groups[key] = []; order.append(key)
+        groups[key].append(i)
+    for key in order:
+        Ps, Fs, Us, Ns, Ms, base = [], [], [], [], [], 0
+        slots = []
+        for i in groups[key]:
+            p = meta['parts'][i]
+            P = arr['P%d' % i].astype(float); F = arr['F%d' % i]
+            m = mats.get(p.get('mat'))
+            if m is None:
+                if plain is None:
+                    plain = bpy.data.materials.new('imported'); plain.diffuse_color = (0.75, 0.75, 0.75, 1)
+                m = plain
+            if m not in slots: slots.append(m)
+            Ps.append(P); Ns.append(arr['N%d' % i].astype(float)); Us.append(arr['U%d' % i])
+            Fs.append(F + base); Ms.append(np.full(len(F), slots.index(m))); base += len(P)
+        P, F, U, N, MI = (np.concatenate(Ps), np.concatenate(Fs), np.concatenate(Us), np.concatenate(Ns),
+                          np.concatenate(Ms))
+        verts = np.column_stack([P[:, 0], -P[:, 2], P[:, 1]])           # game -> Blender
+        me = bpy.data.meshes.new(key)
+        me.from_pydata(verts.tolist(), [], F.tolist())
+        me.update()
+        lu = U[F.reshape(-1)]
+        me.uv_layers.new(name='UVMap').data.foreach_set('uv', lu.reshape(-1).tolist())
+        me.polygons.foreach_set('use_smooth', [True] * len(F))
+        for m in slots: me.materials.append(m)
+        me.polygons.foreach_set('material_index', MI.tolist())
+        try:
+            nb = np.column_stack([N[:, 0], -N[:, 2], N[:, 1]])
+            me.normals_split_custom_set_from_vertices(nb.tolist())
+        except Exception:
+            pass
+        ob = bpy.data.objects.new(key, me); coll.objects.link(ob)
+        ob['import_group'] = ', '.join(sorted({meta['parts'][i].get('group', '') for i in groups[key]}))
+    log('INFO built %d parts from %s' % (len(meta['parts']), os.path.basename(folder)))
+
+
 def import_document(context, doc, collection_name='GameModel'):
     coll = bpy.data.collections.new(collection_name)
     context.scene.collection.children.link(coll)
@@ -1847,8 +1929,10 @@ def load_document(path, spec_paths):
 #  add-on UI
 # =========================================================================
 def _addon_specs():
-    d = os.path.join(_HERE, 'specs')
-    return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith('.zig')) if os.path.isdir(d) else []
+    out = []
+    for d in (os.path.join(_HERE, 'specs'), _USER_SPECS):
+        if os.path.isdir(d): out += sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith('.zig'))
+    return out
 
 
 def _spec_items(self, context):
@@ -1992,8 +2076,14 @@ def cli(argv):
     ap.add_argument('--single-sided', action='store_true', help="don't add back faces to open parts")
     ap.add_argument('--import', dest='imp')
     ap.add_argument('--save-blend')
+    ap.add_argument('--build-parts', metavar='PARTS_JSON', help='build the scene from an imported bike (bike_import)')
+    ap.add_argument('--preset', help='line-up preset (.json) for a model with no reviewed matching yet')
     a = ap.parse_args(argv)
+    global _PRESET
+    _PRESET = a.preset
     log = lambda s: (print(s), sys.stdout.flush())
+    if a.build_parts:
+        build_parts(bpy.context, a.build_parts, log)
     if a.imp:
         import_document(bpy.context, load_document(a.imp, [a.spec] if a.spec else _addon_specs()),
                         os.path.basename(a.imp))

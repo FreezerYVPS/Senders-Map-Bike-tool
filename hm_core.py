@@ -23,6 +23,15 @@ import numpy as np
 SURFACES = ['sand', 'gravel', 'dirt', 'rock', 'highway', 'path', 'forest_floor', 'grass']   # the game's layers
 SURF_NAMES = {'gravel': 'Track dirt 1', 'path': 'Track dirt 2', 'dirt': 'Light dirt', 'sand': 'Sand',
               'rock': 'Rock', 'forest_floor': 'Forest floor', 'grass': 'Grass', 'highway': 'Tarmac'}
+def mix_rgb(rgb, smix, surf_rgb_of):
+    """Show a mixed-in second surface: blend each pixel's colour towards that surface's by its amount."""
+    m = smix >= 0
+    if not m.any(): return
+    lay = (smix[m] >> 8).astype(np.int64); amt = (smix[m] & 255).astype(np.float32)[:, None] / 255.0
+    cols = np.array([surf_rgb_of(k) for k in range(len(SURFACES))], np.float32)[lay]
+    rgb[m, :3] = (rgb[m, :3] * (1 - amt) + cols * amt).astype(np.uint8)
+
+
 SURF_RGB = {'sand': (167, 126, 86), 'gravel': (120, 110, 96), 'dirt': (157, 126, 95), 'rock': (147, 137, 115),
             'highway': (96, 90, 84), 'path': (103, 80, 59), 'forest_floor': (109, 77, 52), 'grass': (71, 79, 35)}
 
@@ -241,7 +250,7 @@ BUMP_DEFAULTS = dict(kind='stamp', radius=1.2, height=0.3, count=40, size_min=0.
                      spacing=1.2, length=20.0, track=-1, s=0.0, area=8.0)
 
 
-PAINT_ARRAYS = ('tsculpt', 'fsculpt', 'mask', 'surf', 'canopy', 'rocks', 'impkeep')   # per-pixel layers of a project
+PAINT_ARRAYS = ('tsculpt', 'fsculpt', 'mask', 'surf', 'canopy', 'rocks', 'impkeep', 'smix')   # per-pixel layers of a project
 JUMP_SPEC_KEYS = ('length', 'height', 'width', 'edge', 'angle', 'offset')       # kept with a saved template
 
 
@@ -282,6 +291,7 @@ class Project:
         self.canopy = np.full((self.n, self.n), -1, np.int16)    # painted tree height 0..255 (-1 = automatic)
         self.rocks = np.full((self.n, self.n), -1, np.int16)     # painted boulders 0..255 (-1 = automatic)
         self.impkeep = np.ones((self.n, self.n), np.float32)     # 1 = imported track kept, 0 = erased there
+        self.smix = np.full((self.n, self.n), -1, np.int16)      # a 2nd surface mixed in: layer*256 + amount (-1 = none)
         self.reference = dict(path='', opacity=0.5, visible=False)
         self.placement = None               # where it sits in the game's map (from the map editor), or None
         self.world = None                   # (lo, hi) the game map's height scale, when the terrain came from it
@@ -606,7 +616,7 @@ class Project:
             for name in PAINT_ARRAYS + ('base_img', 'import_src'):
                 if name + '.npy' in z.namelist():
                     setattr(p, name, np.load(io.BytesIO(z.read(name + '.npy'))))
-            for name, dt, v in (('canopy', np.int16, -1), ('rocks', np.int16, -1), ('impkeep', np.float32, 1)):
+            for name, dt, v in (('canopy', np.int16, -1), ('rocks', np.int16, -1), ('impkeep', np.float32, 1), ('smix', np.int16, -1)):
                 a = getattr(p, name)
                 if a.shape != (p.n, p.n): setattr(p, name, np.full((p.n, p.n), v, dt))
         return p
@@ -618,7 +628,7 @@ class Project:
         for name in ('tsculpt', 'fsculpt', 'mask', 'impkeep'):
             setattr(q, name, bilinear(getattr(self, name), X, Z).astype(np.float32))
         iz, ix = np.clip(np.round(Z).astype(int), 0, self.n - 1), np.clip(np.round(X).astype(int), 0, self.n - 1)
-        for name in ('surf', 'canopy', 'rocks'): setattr(q, name, getattr(self, name)[iz, ix])
+        for name in ('surf', 'canopy', 'rocks', 'smix'): setattr(q, name, getattr(self, name)[iz, ix])
         if self.base_img is not None: q.base_img = bilinear(self.base_img, X, Z).astype(np.float32)
         return q
 
@@ -841,14 +851,15 @@ def export_surface(p, path, info=None, rgba=True):
     Image.fromarray((s.astype(np.int16) + 1).astype(np.uint8), 'L').save(os.path.splitext(path)[0] + '.index.png')
 
 
-def shade(H, px, exag=1.0, surface=None, tw=None, slope_tint=True, palette=None):
-    """RGB hillshade preview: ground colour from the surface, light from the north-west."""
+def shade(H, px, exag=1.0, surface=None, tw=None, slope_tint=True, palette=None, hrange=None):
+    """RGB hillshade preview: ground colour from the surface, light from the north-west.
+    hrange: (low, high) heights for the colour ramp - give the whole map's when shading a part of it."""
     gz, gx = np.gradient(H.astype(np.float32) * exag, px)
     nrm = 1 / np.sqrt(gx * gx + gz * gz + 1)
     l = np.clip((-gx * -0.55 + -gz * -0.55 + 0.63) * nrm, 0, 1)
     l = 0.35 + 0.75 * l
     base = np.empty(H.shape + (3,), np.float32)
-    lo, hi = np.percentile(H, [1, 99]) if H.size else (0, 1)
+    lo, hi = hrange if hrange is not None else (np.percentile(H, [1, 99]) if H.size else (0, 1))
     t = np.clip((H - lo) / max(hi - lo, 1e-3), 0, 1)[..., None]
     base[:] = np.array([96, 112, 58], np.float32) * (1 - t) + np.array([150, 140, 100], np.float32) * t
     if surface is not None:

@@ -563,3 +563,93 @@ def model_from_filename(path):
     for suf in ('.blend.bin', '_blend.json', '.blend'):
         if b.endswith(suf): return b[:-len(suf)]
     return os.path.splitext(b)[0]
+
+
+# ------------------------------------------------------------------ game updates: same layout, new version number
+# The version number in a game file's header is a hash of ALL the spec's types, including the lists of node
+# names. So an update that changes nothing about how files are laid out (a lighting fix, say) still gets a
+# new number. derive_spec() checks that every one of the game's current files reads completely with a known
+# spec's layout; if so it writes that spec again under the new number, with each model's node list taken from
+# the game's own files, so nothing has to wait for the developer.
+
+def _fits(spec, data, header):
+    """True if data (starting with header) is read exactly to its end by spec's layout."""
+    import terrain_io
+    try:
+        return terrain_io.Walker(spec, data).skip(('ref', spec.root), len(header)) == len(data)
+    except Exception:
+        return False
+
+
+def _node_names(spec, path, header):
+    import terrain_io
+    if os.path.getsize(path) > 50_000_000:                     # the map: names only, without decoding it all
+        clone = ZigSpec.__new__(ZigSpec); clone.__dict__.update(spec.__dict__); clone.header = header
+        tf = terrain_io.TerrainFile.open(path, clone)
+        try: return [n['name'] for n in tf.nodes]
+        finally: tf.close()
+    with open(path, 'rb') as f: data = f.read()
+    clone = ZigSpec.__new__(ZigSpec); clone.__dict__.update(spec.__dict__); clone.header = header
+    return [n['name'] for n in clone.decode(data)['nodes']]
+
+
+def _zig_enum(name, values):
+    bits = max(1, (max(len(values) - 1, 1)).bit_length())
+    out = ['pub const @"%s" = enum(u%d) {' % (name, bits)]
+    for i, v in enumerate(values):
+        out.append('    @"%s" = %d,' % (v.replace('\\', '\\\\').replace('"', '\\"'), i))
+    out.append('};')
+    return '\n'.join(out)
+
+
+def derive_spec(game_file, spec_paths, out_dir, log=None):
+    """A spec for a game file whose version number no spec has. Tries each known spec's layout against every
+    game file of that version in the same folder; the first layout that reads them all exactly is written to
+    out_dir as BlendMeshSpec.auto-<hash>.zig (node lists from the game's files). Returns its path, or None."""
+    h = sniff_header(game_file)
+    if not h: return None
+    folder = os.path.dirname(os.path.abspath(game_file))
+    files = [os.path.join(folder, f) for f in sorted(os.listdir(folder)) if f.endswith('.blend.bin')]
+    files = [f for f in files if sniff_header(f) == h]
+    if not files: return None
+    with open(game_file, 'rb') as f:
+        head = f.read(256)
+    header = head[:head.index(b'\n') + 1]
+    for sp_path in spec_paths:
+        try:
+            base = ZigSpec.load(sp_path)
+        except Exception:
+            continue
+        ok = True
+        for f in files:
+            if os.path.getsize(f) > 50_000_000:
+                try: _node_names(base, f, header)                    # reads the whole file, checks its length
+                except Exception: ok = False
+            else:
+                with open(f, 'rb') as fh: data = fh.read()
+                ok = _fits(base, data, header)
+            if not ok:
+                if log: log('%s: %s does not fit' % (os.path.basename(sp_path), os.path.basename(f)))
+                break
+        if not ok: continue
+        with open(sp_path, encoding='utf-8') as fh: src = fh.read()
+        hdr_txt = header.decode('utf-8').rstrip('\n')
+        src = re.sub(r'pub const binary_header = "[^"]*";', lambda m: 'pub const binary_header = "%s\\n";' % hdr_txt,
+                     src, count=1)
+        for f in files:
+            model = model_from_filename(f)
+            if model not in base.models: continue
+            names = _node_names(base, f, header)
+            pat = re.compile(r'pub const @"%s\.blend\.generated\.Nodes" = enum\([^)]*\) \{.*?\n\};' % re.escape(model), re.S)
+            src = pat.sub(lambda m: _zig_enum('%s.blend.generated.Nodes' % model, names), src, count=1)
+        note = ('// MADE BY GAME MODEL EXPORTER for game files version %s: the same layout as %s (every game file\n'
+                '// of this version reads with it exactly); node lists taken from the game\'s own files.\n'
+                % (h, os.path.basename(sp_path)))
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, 'BlendMeshSpec.auto-%s.zig' % h)
+        with open(out + '.part', 'w', encoding='utf-8') as fh: fh.write(note + src)
+        ZigSpec.load(out + '.part')                                  # must load
+        os.replace(out + '.part', out)
+        if log: log('made %s from %s' % (os.path.basename(out), os.path.basename(sp_path)))
+        return out
+    return None
